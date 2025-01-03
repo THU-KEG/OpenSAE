@@ -4,7 +4,12 @@ import sys
 import torch
 import transformers
 
-from ...sae_utils import PreTrainedSae, SaeEncoderOutput, SaeDecoderOutput, SaeForwardOutput
+from ...sae_utils import (
+    PreTrainedSae, 
+    SaeEncoderOutput, 
+    SaeDecoderOutput, 
+    SaeForwardOutput
+)
 from .configuration_open_sae import PretrainedSaeConfig
 
 
@@ -20,11 +25,11 @@ class OpenSae(PreTrainedSae):
         
         self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
-    def encode(self, **kwargs):
+    def encode(self, **kwargs) -> SaeEncoderOutput:
         pass
     
-    def decode(self, **kwargs):
+    def decode(self, **kwargs) -> SaeDecoderOutput:
         pass
     
-    def forward(self, **kwargs):
+    def forward(self, **kwargs) -> SaeForwardOutput:
         pass

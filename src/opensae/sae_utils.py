@@ -11,25 +11,6 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
 
-class PreTrainedSae(PreTrainedModel):
-    def __init__(self, config, **kwargs):
-        self.config = config
-        super().__init__(config, **kwargs)
-        
-    @abstractmethod
-    def encode(self, **kwargs):
-        pass
-    
-    @abstractmethod
-    def decode(self, **kwargs):
-        pass
-    
-    @abstractmethod
-    def forward(self, **kwargs):
-        pass
-
-
-
 @dataclass
 class SaeEncoderOutput(ModelOutput):
     latent_indices: Tensor
@@ -48,3 +29,22 @@ class SaeForwardOutput(SaeEncoderOutput, SaeDecoderOutput):
     auxk_loss: Tensor | None
     multi_topk_loss: Tensor | None
     l1_loss: Tensor | None
+    
+
+
+class PreTrainedSae(PreTrainedModel):
+    def __init__(self, config, **kwargs):
+        self.config = config
+        super().__init__(config, **kwargs)
+        
+    @abstractmethod
+    def encode(self, **kwargs) -> SaeEncoderOutput:
+        pass
+    
+    @abstractmethod
+    def decode(self, **kwargs) -> SaeDecoderOutput:
+        pass
+    
+    @abstractmethod
+    def forward(self, **kwargs) -> SaeForwardOutput:
+        pass
