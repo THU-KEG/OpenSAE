@@ -1,0 +1,33 @@
+[project]
+name = "opensae"
+authors = [
+    {name = "Zijun Yao", email = "yaozj20@mails.tsinghua.edu.cn"},
+]
+description = "OpenSAE for SAE. It provides useful tools for: 1. SAE modeling; 2. SAE training; 3. SAE evaluation; and 4. SAE-based LLM analysis."
+license = {text = "MIT"}
+dynamic = ["version"]
+
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate",
+    "safetensors",
+    "torch >= 2.4.0",
+    "transformers >= 4.44.1",
+    "tokenizers",
+    "torchdata",
+    "triton",
+    "tqdm",
+    "wandb",
+    "ninja",
+    "simple_parsing",
+    "natsort",
+    "bitsandbytes >= 0.43.2",
+    "flash-attn >= 2.6.3",
+    "datasets >= 2.19.1"
+]
+
+
+
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
