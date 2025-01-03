@@ -16,8 +16,9 @@ class OpenSaeConfig(PretrainedSaeConfig):
         dtype: torch.dtype | None = None,
         k: int | None = 128,
         multi_topk: int | None = 4,
-        jumprelu_delta: float | None = 0.5,
+        jumprelu_theta: float | None = 0.5,
         normalize_decoder: bool = True,
+        decoder_impl: str = "triton",
         **kwargs
     ):
         super().__init__(
@@ -47,5 +48,7 @@ class OpenSaeConfig(PretrainedSaeConfig):
                 assert self.multi_topk * k < feature_size, "multi_topk * k must be less than num_latents"
     
         elif activation == "jumprelu":
-            assert self.jumprelu_delta is not None, "jumprelu_delta must be provided when using jumprelu activation"
-            self.jumprelu_delta = jumprelu_delta
+            assert self.jumprelu_theta is not None, "jumprelu_theta must be provided when using jumprelu activation"
+            self.jumprelu_theta = jumprelu_theta
+            
+        assert decoder_impl in ["triton", "torch"], "decoder_impl must be either 'triton' or 'torch'"

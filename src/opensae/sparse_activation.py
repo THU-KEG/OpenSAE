@@ -73,6 +73,3 @@ if __name__ == "__main__":
     feature_activation, feature_indices = topk(x)
     feature_activation.sum().backward()
     print(x.grad)
-    
-    
-    
