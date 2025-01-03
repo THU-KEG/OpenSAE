@@ -14,11 +14,16 @@ class OpenSaeConfig(PretrainedSaeConfig):
         model_name: str = "meta-llama/Meta-Llama-3-8B",
         activation: str = "topk",
         dtype: torch.dtype | None = None,
+        # sparse activation related
         k: int | None = 128,
-        multi_topk: int | None = 4,
         jumprelu_theta: float | None = 0.5,
+        # decoder related
         normalize_decoder: bool = True,
         decoder_impl: str = "triton",
+        # loss related
+        multi_topk: int | None = 4,
+        auxk_alpha: float | None = 1e-2,
+        l1_coef: float | None = None,
         **kwargs
     ):
         super().__init__(
@@ -32,8 +37,7 @@ class OpenSaeConfig(PretrainedSaeConfig):
             dtype            = dtype,
             **kwargs
         )
-        
-        self.normalize_decoder = normalize_decoder
+
 
         if activation == "topk":
             assert k is not None and k > 0, "k must be greater than 0 when using topk activation"
@@ -50,5 +54,11 @@ class OpenSaeConfig(PretrainedSaeConfig):
         elif activation == "jumprelu":
             assert self.jumprelu_theta is not None, "jumprelu_theta must be provided when using jumprelu activation"
             self.jumprelu_theta = jumprelu_theta
-            
+
+        self.normalize_decoder = normalize_decoder
         assert decoder_impl in ["triton", "torch"], "decoder_impl must be either 'triton' or 'torch'"
+        self.decoder_impl = decoder_impl
+
+        self.auxk_alpha = auxk_alpha
+        self.l1_coef = l1_coef
+        self.dtype = dtype
