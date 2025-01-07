@@ -9,6 +9,9 @@ import transformers
 from transformers.utils import logging
 from transformers.configuration_utils import PretrainedConfig
 
+logging.set_verbosity_info()
+logger = logging.get_logger("sae")
+
 
 class PretrainedSaeConfig(PretrainedConfig):
     def __init__(
@@ -20,9 +23,10 @@ class PretrainedSaeConfig(PretrainedConfig):
         output_hookpoint: str,
         model_name: str,
         activation: str,
-        dtype: torch.dtype | None,
+        torch_dtype: torch.dtype | None,
         **kwargs
     ):
+        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.feature_size = feature_size
         
@@ -38,14 +42,20 @@ class PretrainedSaeConfig(PretrainedConfig):
             "topk",
             "jumprelu",
         ]
-        
-        self.dtype = dtype
-        if self.dtype is None:
-            self.dtype = torch.bfloat16
-            logging.warning_advice(f"dtype is not provided, defaulting to {self.dtype}")
-        
-        super().__init__(**kwargs)
 
+        if torch_dtype is None:
+            self.torch_dtype = "bfloat16"
+            logger.warning_advice(f"dtype is not provided, defaulting to {self.torch_dtype}")
+        else:
+            self.torch_dtype = torch_dtype
+
+
+    def get_torch_dtype(self) -> torch.dtype:
+        if not isinstance(self.torch_dtype, torch.dtype):
+            dtype = getattr(torch, self.torch_dtype)
+            assert isinstance(dtype, torch.dtype)
+        
+        return dtype
 
         
 __all__ = [

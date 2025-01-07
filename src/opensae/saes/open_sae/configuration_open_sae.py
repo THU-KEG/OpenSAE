@@ -7,13 +7,13 @@ class OpenSaeConfig(PretrainedSaeConfig):
     def __init__(
         self,
         hidden_size: int = 4096,
-        feature_size: int = 131072,
+        feature_size: int = 262144,
         input_normalize: bool = True,
         input_hookpoint: str = "layers.0",
         output_hookpoint: str = "layers.0",
-        model_name: str = "meta-llama/Meta-Llama-3-8B",
+        model_name: str = "meta-llama/meta-llama-3.1-8b",
         activation: str = "topk",
-        dtype: torch.dtype | None = None,
+        torch_dtype: torch.dtype | None = None,
         # sparse activation related
         k: int | None = 128,
         jumprelu_theta: float | None = 0.5,
@@ -34,7 +34,7 @@ class OpenSaeConfig(PretrainedSaeConfig):
             output_hookpoint = output_hookpoint,
             model_name       = model_name,
             activation       = activation,
-            dtype            = dtype,
+            torch_dtype      = torch_dtype,
             **kwargs
         )
 
@@ -61,4 +61,3 @@ class OpenSaeConfig(PretrainedSaeConfig):
 
         self.auxk_alpha = auxk_alpha
         self.l1_coef = l1_coef
-        self.dtype = dtype

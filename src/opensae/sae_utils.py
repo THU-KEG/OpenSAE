@@ -19,23 +19,24 @@ except ImportError:
 
 @dataclass
 class SaeEncoderOutput(ModelOutput):
-    sparse_feature_activations: Tensor
-    sparse_feature_indices: Tensor
-    all_features: Tensor | None
+    sparse_feature_activations: Tensor = None
+    sparse_feature_indices: Tensor = None
+    all_features: Tensor | None = None
 
 
 @dataclass
 class SaeDecoderOutput(ModelOutput):
-    sae_output: Tensor
+    sae_output: Tensor = None
 
 
 @dataclass
 class SaeForwardOutput(SaeEncoderOutput, SaeDecoderOutput):
-    loss: Tensor
-    reconstruction_loss: Tensor
-    auxk_loss: Tensor | None
-    multi_topk_loss: Tensor | None
-    l1_loss: Tensor | None
+    reconstruction_loss: Tensor = None
+    auxk_loss: Tensor | None = None
+    multi_topk_loss: Tensor | None = None
+    l1_loss: Tensor | None = None
+    l2_loss: Tensor | None = None
+    loss: Tensor = None
     
 
 
@@ -50,6 +51,15 @@ class PreTrainedSae(PreTrainedModel):
     
     @abstractmethod
     def decode(self, **kwargs) -> SaeDecoderOutput:
+        pass
+    
+    @abstractmethod
+    def reconstruction_loss(
+        self, 
+        hidden: Tensor, 
+        hidden_variance: Tensor, 
+        sae_output: Tensor
+    ) -> Tensor:
         pass
     
     @abstractmethod
