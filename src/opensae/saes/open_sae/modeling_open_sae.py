@@ -135,11 +135,12 @@ class OpenSae(PreTrainedOpenSae):
     def decode(self, feature_indices: Tensor, feature_activation: Tensor) -> SaeDecoderOutput:
         assert self.W_dec is not None, "Decoder weight was not initialized."
 
-        reconstruction = self.decode_fn(
-            feature_indices,
-            feature_activation.to(torch.float32),
-            self.W_dec.mT.to(torch.float32)
-        )        
+        with torch.cuda.device(self.W_dec.device.index):
+            reconstruction = self.decode_fn(
+                feature_indices,
+                feature_activation.to(torch.float32),
+                self.W_dec.mT.to(torch.float32)
+            )        
         reconstruction = reconstruction + self.b_dec
 
         return SaeDecoderOutput(sae_output = reconstruction)
