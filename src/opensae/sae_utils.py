@@ -22,6 +22,8 @@ class SaeEncoderOutput(ModelOutput):
     sparse_feature_activations: Tensor = None
     sparse_feature_indices: Tensor = None
     all_features: Tensor | None = None
+    input_mean: Tensor | None = None
+    input_std: Tensor | None = None
 
 
 @dataclass

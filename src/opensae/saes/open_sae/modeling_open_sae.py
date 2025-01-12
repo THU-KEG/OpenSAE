@@ -111,14 +111,17 @@ class OpenSae(PreTrainedOpenSae):
 
     def pre_process(self, hidden: Tensor) -> Tensor:
         if self.config.input_normalize:
-            hidden, mu, std = self.normalization(hidden)
+            hidden, mu, std = self.normalization(hidden, self.config.input_normalize_eps)
+        
+        if not self.config.normalize_shift_back:
+            mu, std = None, None
         
         # Remove decoder bias as per Anthropic
-        return hidden.to(self.b_dec.dtype) - self.b_dec
+        return hidden.to(self.b_dec.dtype) - self.b_dec, mu, std
 
 
     def encode(self, hidden: Tensor, return_all_features: bool = False) -> SaeEncoderOutput:
-        sae_input = self.pre_process(hidden)
+        sae_input, input_mean, input_std = self.pre_process(hidden)
         all_features = self.encoder(sae_input)
         # Remove negative features
         all_features = torch.nn.functional.relu(all_features)
@@ -128,20 +131,33 @@ class OpenSae(PreTrainedOpenSae):
         return SaeEncoderOutput(
             sparse_feature_activations = feature_activation,
             sparse_feature_indices = feature_indices,
-            all_features = all_features if return_all_features else None
+            all_features = all_features if return_all_features else None,
+            input_mean = input_mean if self.config.input_normalize else None,
+            input_std = input_std if self.config.input_normalize else None
         )
 
 
-    def decode(self, feature_indices: Tensor, feature_activation: Tensor) -> SaeDecoderOutput:
+    def decode(
+        self, 
+        feature_indices: Tensor, 
+        feature_activation: Tensor,
+        input_mean: Tensor | None = None,
+        input_std: Tensor | None = None
+    ) -> SaeDecoderOutput:
         assert self.W_dec is not None, "Decoder weight was not initialized."
+        if self.config.normalize_shift_back:
+            assert input_mean is not None and input_std is not None, "Input mean and std must be provided for shift back normalization."            
 
         with torch.cuda.device(self.W_dec.device.index):
             reconstruction = self.decode_fn(
                 feature_indices,
                 feature_activation.to(torch.float32),
                 self.W_dec.mT.to(torch.float32)
-            )        
+            )
         reconstruction = reconstruction + self.b_dec
+        
+        if self.config.normalize_shift_back:
+            reconstruction = reconstruction * (input_std + self.config.input_normalize_eps) + input_mean
 
         return SaeDecoderOutput(sae_output = reconstruction)
 
@@ -152,9 +168,7 @@ class OpenSae(PreTrainedOpenSae):
         hidden_variance: Tensor,
         sae_output: Tensor
     ) -> Tensor:
-        print("Sae Output", sae_output)
         reconstruction_error = sae_output - hidden
-        print("Reconstruction Error", reconstruction_error)
         dimensional_l2_loss = reconstruction_error.pow(2).sum(0)    # size = (hidden_size,), per-dimensional L2 loss
         normalized_l2_loss = dimensional_l2_loss / hidden_variance  # putting everything on a reasonable scale
         reconstruction_loss = torch.mean(normalized_l2_loss)
@@ -174,6 +188,9 @@ class OpenSae(PreTrainedOpenSae):
         reconstruction_error: Tensor,
         hidden_variance: Tensor, 
         dead_mask: Tensor,
+        all_features: Tensor,
+        input_mean: Tensor | None = None,
+        input_std: Tensor | None = None
     ) -> Tensor:
         assert dead_mask is not None, "Dead mask is not provided."
         num_dead = int(dead_mask.sum())
@@ -189,7 +206,7 @@ class OpenSae(PreTrainedOpenSae):
         k_aux = min(k_aux, num_dead)
 
         # Don't include living latents in this loss
-        auxk_all_features = torch.where(dead_mask[None], sae_output.all_features, -torch.inf)
+        auxk_all_features = torch.where(dead_mask[None], all_features, -torch.inf)
 
         # Top-k dead latents
         auxk_feature_activations, auxk_feature_indices = auxk_all_features.topk(k_aux, sorted=False)
@@ -198,7 +215,8 @@ class OpenSae(PreTrainedOpenSae):
         # top k living latents
         auxk_sae_decoder_output = self.decode(
             auxk_feature_indices, 
-            auxk_feature_activations
+            auxk_feature_activations,
+            input_mean, input_std
         ).sae_output
         auxk_loss = (auxk_sae_decoder_output - reconstruction_error).pow(2).sum(0)
         auxk_loss = scale * torch.mean(auxk_loss / hidden_variance)
@@ -215,7 +233,9 @@ class OpenSae(PreTrainedOpenSae):
         sae_encoder_output = self.encode(hidden, return_all_features = self.config.multi_topk)
         sae_decoder_output = self.decode(
             sae_encoder_output.sparse_feature_indices, 
-            sae_encoder_output.sparse_feature_activations
+            sae_encoder_output.sparse_feature_activations,
+            sae_encoder_output.input_mean,
+            sae_encoder_output.input_std
         ).sae_output
         assert sae_decoder_output.shape == hidden.shape, f"Output shape {sae_decoder_output.shape} does not match input shape {hidden.shape}"
         
@@ -235,22 +255,29 @@ class OpenSae(PreTrainedOpenSae):
         
         # 3.2. AuxK loss: help to reduce dead features.
         # INVOKE Extra decoder pass for AuxK loss
-        if dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
+        if self.config.auxk_alpha > 1e-6 and dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
             auxk_loss = self.auxk_loss(
                 hidden = hidden,
                 sae_output = sae_decoder_output,
                 reconstruction_error = reconstruction_error,
                 hidden_variance = per_dimension_variance,
-                dead_mask = dead_mask
+                dead_mask = dead_mask,
+                all_features = sae_encoder_output.all_features,
+                input_mean = sae_encoder_output.input_mean,
+                input_std = sae_encoder_output.input_std
             )
         else:
             auxk_loss = sae_decoder_output.new_tensor(0.0)
 
         # 3.3. Multi-TopK loss: help to reduce overfitting to k
         # INVOKE Extra decoder pass for multi-topk loss
-        if self.config.multi_topk:            
+        if self.config.multi_topk:
             multi_topk_feature_activations, multi_topk_feature_indices = self.multi_topk(sae_encoder_output.all_features)
-            multi_topk_sae_decoder_output = self.decode(multi_topk_feature_indices, multi_topk_feature_activations).sae_output
+            print(f"Multi TopK Indices Shape: ", multi_topk_feature_indices.shape)
+            multi_topk_sae_decoder_output = self.decode(
+                multi_topk_feature_indices, multi_topk_feature_activations,
+                sae_encoder_output.input_mean, sae_encoder_output.input_std
+            ).sae_output
 
             _, _, multi_topk_loss = self.reconstruction_loss(
                 hidden = hidden, 
@@ -266,6 +293,9 @@ class OpenSae(PreTrainedOpenSae):
         if self.config.l1_coef is not None and self.cfg.l1_coef > 1e-8:
             l1_loss = torch.norm(sae_encoder_output.all_features, p=1, dim=-1).mean() * self.cfg.l1_coef
 
+        final_loss = reconstruction_loss + multi_topk_loss / 8 + auxk_loss * self.config.auxk_alpha
+        if l1_loss > 1e-8:
+            final_loss += l1_loss
 
         return SaeForwardOutput(
             # Encoder Outputs
@@ -276,9 +306,8 @@ class OpenSae(PreTrainedOpenSae):
             sae_output = sae_decoder_output,
             # Loss Outputs
             reconstruction_loss = reconstruction_loss,
-            auxk_loss = auxk_loss,
             multi_topk_loss = multi_topk_loss,
+            auxk_loss = auxk_loss,
             l1_loss = l1_loss,
-            l2_loss = l2_loss,
-            loss = reconstruction_loss + auxk_loss + multi_topk_loss,
+            loss = final_loss,
         )

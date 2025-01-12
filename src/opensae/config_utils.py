@@ -19,6 +19,8 @@ class PretrainedSaeConfig(PretrainedConfig):
         hidden_size: int,
         feature_size: int,
         input_normalize: bool,
+        normalize_shift_back: bool,
+        input_normalize_eps: float,
         input_hookpoint: str,
         output_hookpoint: str,
         model_name: str,
@@ -31,6 +33,8 @@ class PretrainedSaeConfig(PretrainedConfig):
         self.feature_size = feature_size
         
         self.input_normalize = input_normalize
+        self.normalize_shift_back = normalize_shift_back
+        self.input_normalize_eps = input_normalize_eps
         
         self.input_hookpoint = input_hookpoint
         self.output_hookpoint = output_hookpoint
@@ -44,7 +48,7 @@ class PretrainedSaeConfig(PretrainedConfig):
         ]
 
         if torch_dtype is None:
-            self.torch_dtype = "bfloat16"
+            self.torch_dtype = "float32"
             logger.warning_advice(f"dtype is not provided, defaulting to {self.torch_dtype}")
         else:
             self.torch_dtype = torch_dtype

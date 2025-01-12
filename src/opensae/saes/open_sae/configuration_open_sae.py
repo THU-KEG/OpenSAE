@@ -9,6 +9,8 @@ class OpenSaeConfig(PretrainedSaeConfig):
         hidden_size: int = 4096,
         feature_size: int = 262144,
         input_normalize: bool = True,
+        normalize_shift_back: bool = False,
+        input_normalize_eps: float = 1e-5,
         input_hookpoint: str = "layers.0",
         output_hookpoint: str = "layers.0",
         model_name: str = "meta-llama/meta-llama-3.1-8b",
@@ -21,7 +23,7 @@ class OpenSaeConfig(PretrainedSaeConfig):
         normalize_decoder: bool = True,
         decoder_impl: str = "triton",
         # loss related
-        multi_topk: int | None = 4,
+        multi_topk_multiplier: int | None = 4,
         auxk_alpha: float | None = 1e-2,
         l1_coef: float | None = None,
         **kwargs
@@ -29,7 +31,9 @@ class OpenSaeConfig(PretrainedSaeConfig):
         super().__init__(
             hidden_size      = hidden_size,
             feature_size     = feature_size,
-            input_normalize  = input_normalize,
+            input_normalize      = input_normalize,
+            normalize_shift_back = normalize_shift_back,
+            input_normalize_eps  = input_normalize_eps,
             input_hookpoint  = input_hookpoint,
             output_hookpoint = output_hookpoint,
             model_name       = model_name,
@@ -43,7 +47,7 @@ class OpenSaeConfig(PretrainedSaeConfig):
             assert k is not None and k > 0, "k must be greater than 0 when using topk activation"
             self.k = k
             
-            self.multi_topk = multi_topk
+            self.multi_topk = multi_topk_multiplier
             
             if self.multi_topk is not None and self.multi_topk < 1e-3:
                 self.multi_topk = None

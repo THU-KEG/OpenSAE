@@ -33,6 +33,23 @@ docker run --gpus all \
 The Docker image is built on top of the `nvcr.io/nvidia/pytorch:24.02-py3` image. We inject a miniconda environment with the required dependencies into the image.
 
 
+## How to Use
+
+### 1. Load the SAE
+
+
+### 2. Bind the SAE with a LLM
+
+
+### 3. LLM Intervention
+
+
+### 4. SAE Evaluation
+
+
+### 5. SAE Training
+
+
 ## Acknowledgements
 
 This project draws inspiration from various third-party SAE (Sparse Autoencoder) tools. We would like to express our heartfelt gratitude to the following:
