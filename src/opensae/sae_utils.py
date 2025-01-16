@@ -11,11 +11,15 @@ from transformers.utils import logging
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
+logging.set_verbosity_info()
+logger = logging.get_logger("sae")
+
 try:
     from .sparse_kernels import TritonDecoder
     TRITON_ENABLED = True
 except ImportError:
     TRITON_ENABLED = False
+    logger.warning("Import sparse decoder failed, cannot use Triton implementation of SAE decoder.")
 
 @dataclass
 class SaeEncoderOutput(ModelOutput):

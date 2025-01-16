@@ -50,7 +50,7 @@ class OpenSae(PreTrainedOpenSae):
             in_features = self.config.hidden_size, 
             out_features = self.config.feature_size, 
             device = device, 
-            dtype = self.config.get_torch_dtype()
+            dtype = self.config.torch_dtype
         )
         self.encoder.bias.data.zero_()
 
@@ -60,7 +60,7 @@ class OpenSae(PreTrainedOpenSae):
         self.b_dec = torch.nn.Parameter(
             torch.zeros(
                 self.config.hidden_size,
-                dtype = self.config.get_torch_dtype(), 
+                dtype = self.config.torch_dtype, 
                 device = device
             )
         )
@@ -273,7 +273,6 @@ class OpenSae(PreTrainedOpenSae):
         # INVOKE Extra decoder pass for multi-topk loss
         if self.config.multi_topk:
             multi_topk_feature_activations, multi_topk_feature_indices = self.multi_topk(sae_encoder_output.all_features)
-            print(f"Multi TopK Indices Shape: ", multi_topk_feature_indices.shape)
             multi_topk_sae_decoder_output = self.decode(
                 multi_topk_feature_indices, multi_topk_feature_activations,
                 sae_encoder_output.input_mean, sae_encoder_output.input_std

@@ -28,7 +28,6 @@ class PretrainedSaeConfig(PretrainedConfig):
         torch_dtype: torch.dtype | None,
         **kwargs
     ):
-        super().__init__(**kwargs)
         self.hidden_size = hidden_size
         self.feature_size = feature_size
         
@@ -52,6 +51,8 @@ class PretrainedSaeConfig(PretrainedConfig):
             logger.warning_advice(f"dtype is not provided, defaulting to {self.torch_dtype}")
         else:
             self.torch_dtype = torch_dtype
+        
+        super().__init__(**kwargs)
 
 
     def get_torch_dtype(self) -> torch.dtype:
