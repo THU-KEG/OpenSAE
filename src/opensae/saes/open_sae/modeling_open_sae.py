@@ -50,7 +50,7 @@ class OpenSae(PreTrainedOpenSae):
             in_features = self.config.hidden_size, 
             out_features = self.config.feature_size, 
             device = device, 
-            dtype = self.config.torch_dtype
+            dtype = self.config.get_torch_dtype()
         )
         self.encoder.bias.data.zero_()
 
@@ -60,7 +60,7 @@ class OpenSae(PreTrainedOpenSae):
         self.b_dec = torch.nn.Parameter(
             torch.zeros(
                 self.config.hidden_size,
-                dtype = self.config.torch_dtype, 
+                dtype = self.config.get_torch_dtype(), 
                 device = device
             )
         )

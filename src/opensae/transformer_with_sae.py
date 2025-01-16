@@ -6,7 +6,7 @@ import torch
 import transformers
 
 from transformers.utils import logging
-from transformers import PreTrainedModel, PretrainedConfig
+from transformers import PreTrainedModel, PretrainedConfig, GenerationConfig
 
 logging.set_verbosity_info()
 logger = logging.get_logger("sae")
@@ -19,6 +19,16 @@ from .sae_utils import (
 )
 from .config_utils import PretrainedSaeConfig
 from .saes.open_sae import OpenSaeConfig, OpenSae
+
+
+class InterventionConfig(PretrainedConfig):
+    def __init__(self, **kwargs):
+        self.intervention = kwargs.pop("intervention", False)
+        self.intervention_mode = kwargs.pop("intervention_mode", "set") # set, multiply, add
+        assert self.intervention_mode in ["set", "multiply", "add"], "intervention_mode must be one of `set`, `multiply`, and `add`"
+        self.intervention_value = kwargs.pop("intervention_value", 0.0)
+        
+        self.prompt_only = kwargs.pop("prompt_only", False)
 
 
 class TransformerWithSae(torch.nn.Module):
@@ -52,7 +62,7 @@ class TransformerWithSae(torch.nn.Module):
         if self.config.output_hookpoint != self.config.input_hookpoint:
             self._register_output_hook()
             
-        self.generate = self.transformer.generate
+        self.prefilling_stage = False
 
 
     def _input_hook_fn(
@@ -114,8 +124,9 @@ class TransformerWithSae(torch.nn.Module):
             reconstructed_output[self.token_indices] = sae_output.view(-1, hidden_size)
         else:
             reconstructed_output = sae_output.view(bsz, seq_len, hidden_size)
-        
-        reconstructed_output = reconstructed_output.to(output_tensor_dtype)
+
+        reconstructed_output = output_tensor
+        # reconstructed_output = reconstructed_output.to(output_tensor_dtype)
         
         if isinstance(output, tuple):
             return_output_tuple = (reconstructed_output,) + output[1:]
@@ -123,7 +134,6 @@ class TransformerWithSae(torch.nn.Module):
         else:
             return reconstructed_output
             
-
 
     def _register_input_hook(self):
         input_hookpoint = self.config.input_hookpoint
@@ -141,7 +151,13 @@ class TransformerWithSae(torch.nn.Module):
         except:
             self.output_module = self.transformer.get_submodule("model." + output_hookpoint)
         self.output_module.register_forward_hook(self._output_hook_fn)
-        
-    
+
+
     def forward(self, *inputs, **kwargs):
-        return self.transformer(*inputs, **kwargs)
+        forward_output = self.transformer(*inputs, **kwargs)
+        self.prefilling_stage = False
+        return forward_output
+    
+    def generate(self, *inputs, **kwargs):
+        self.prefilling_stage = True
+        return self.transformer.generate(*inputs, **kwargs)
