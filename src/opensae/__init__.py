@@ -3,7 +3,7 @@ __copyright__ = """
 """
 
 __authors__ = """
-    Zijun Yao
+    Mechanistic Interpretability Teams in Knowledge Engineering Group
 """
 
 __license__ = """

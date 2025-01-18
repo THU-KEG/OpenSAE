@@ -33,6 +33,12 @@ docker run --gpus all \
 The Docker image is built on top of the `nvcr.io/nvidia/pytorch:24.02-py3` image. We inject a miniconda environment with the required dependencies into the image.
 
 
+## Native SAE in OpenSAE
+
+
+We release OpenSAE, a large-scale pre-trained SAE for LLaMA-3.1-8B.
+
+
 ## How to Use
 
 ### 1. Load the SAE
@@ -41,7 +47,7 @@ OpenSAE allows to load the SAE with only one line of code:
 
 ```python
 from opensae import OpenSae
-OpenSae.from_pretrained(/dir/to/sae)
+OpenSae.from_pretrained("/dir/to/sae")
 ```
 
 
@@ -92,7 +98,7 @@ This method implement the decoder forward pass.
 
 
 
-### 2. Bind the SAE with a LLM
+### 2. Bind the SAE with an LLM
 
 
 ### 3. LLM Intervention
@@ -110,13 +116,19 @@ We introduce the intervention config below:
 - intervention_value: `float`, optional, default to `0.0`. The intervention value.
 
 
-### 4. Automatic Interpret SAE features
+### 4. Automatically Find features in SAE
 
 
 ### 5. SAE Evaluation
 
 
 ### 6. SAE Training
+
+
+## Ongoing Works
+
+1. To support more Open-sourced SAEs, including: LLaMA-Scope, and Gemma-Scope
+2. To finalize our training infra.
 
 
 ## Acknowledgements
