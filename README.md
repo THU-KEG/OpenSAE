@@ -33,7 +33,7 @@ docker run --gpus all \
 The Docker image is built on top of the `nvcr.io/nvidia/pytorch:24.02-py3` image. We inject a miniconda environment with the required dependencies into the image.
 
 
-## Quick Start
+## How to Use
 
 ### 1. Load the SAE
 
@@ -91,13 +91,26 @@ This method implement the decoder forward pass.
 
 
 
+
 ### 2. Bind the SAE with a LLM
 
 
 ### 3. LLM Intervention
 
 
-### 4. SAE AutoInterpret
+The intervention operation is controlled by the InterventionConfig class. 
+The intertention config can be passed to `TransformerWithSae` when initialize the class.
+It can also be altered by calling the `update_intervention_config` method after the TransformerWithSae class is already instantiated.
+We introduce the intervention config below:
+
+- prompt_only: `bool`, optional, default to `False`. When set to `True`, the SAE is only applied to the prompts in the prefilling stage. The SAE will not by applied to the generated tokens during the generation stage.
+- intervention: `bool`, optional, default to `False`. When set to `True`, the sparse activation value will be altered according to `intervention_mode`, `intervention_indices`, and `intervention_value`. Otherwise, the hidden is replaced by the reconstruction directly, without altering the sparse activations.
+- intervention_mode: `str`, optional, default to `set`. Select from `set`, `add`, and `multiply`. **set** means that the sparse activation values according to the `intervention_indices` is set to the `intervention_value`. **add** means that `intervention_value` will be added to the sparse activation values. **multiply** means that we multiply the sparse activation value by the factor `intervention_value` in `intervention_indices`.
+- intervention_indices: `List[int] | None`, optional, default to `None`. It specifies which features are intervened.
+- intervention_value: `float`, optional, default to `0.0`. The intervention value.
+
+
+### 4. Automatic Interpret SAE features
 
 
 ### 5. SAE Evaluation
