@@ -21,14 +21,20 @@ from .config_utils import PretrainedSaeConfig
 from .saes.open_sae import OpenSaeConfig, OpenSae
 
 
+
 class InterventionConfig(PretrainedConfig):
     def __init__(self, **kwargs):
         self.intervention = kwargs.pop("intervention", False)
         self.intervention_mode = kwargs.pop("intervention_mode", "set") # set, multiply, add
         assert self.intervention_mode in ["set", "multiply", "add"], "intervention_mode must be one of `set`, `multiply`, and `add`"
+
+        self.intervention_indices = kwargs.pop("intervention_indices", None)
+        if self.intervention:
+            assert self.intervention_indices is not None, "intervention indices are not provided when set intervention to True"
         self.intervention_value = kwargs.pop("intervention_value", 0.0)
-        
+
         self.prompt_only = kwargs.pop("prompt_only", False)
+
 
 
 class TransformerWithSae(torch.nn.Module):
@@ -36,7 +42,8 @@ class TransformerWithSae(torch.nn.Module):
         self,
         transformer: transformers.PreTrainedModel | Path | str,
         sae: PreTrainedSae | Path | str,
-        device: str | torch.device = "cpu"
+        device: str | torch.device = "cpu",
+        intervention_config: InterventionConfig | None = None
     ):
         super().__init__()
         
@@ -63,6 +70,10 @@ class TransformerWithSae(torch.nn.Module):
             self._register_output_hook()
             
         self.prefilling_stage = False
+        
+        self.intervention_config = intervention_config
+        if self.intervention_config is None:
+            self.intervention_config = InterventionConfig()
 
 
     def _input_hook_fn(
@@ -71,6 +82,9 @@ class TransformerWithSae(torch.nn.Module):
         input: torch.Tensor | tuple[torch.Tensor],
         output: torch.Tensor | tuple[torch.Tensor]
     ):
+        if self.intervention_config.prompt_only and not self.prefilling_stage:
+            return
+        
         if isinstance(output, tuple):
             output_tensor = output[0]
         else:
@@ -90,6 +104,7 @@ class TransformerWithSae(torch.nn.Module):
         self.encoder_output = self.sae.encode(sae_input)
         
         if self.config.output_hookpoint != self.config.input_hookpoint:
+            self.prefilling_stage = False
             return
         
         return self._output_hook_fn(module, input, output)
@@ -101,6 +116,9 @@ class TransformerWithSae(torch.nn.Module):
         input: torch.Tensor | tuple[torch.Tensor],
         output: torch.Tensor | tuple[torch.Tensor]
     ):
+        if self.intervention_config.prompt_only and not self.prefilling_stage:
+            return
+
         assert self.encoder_output is not None, "encoder_output is None"
         
         if isinstance(output, tuple):
@@ -125,9 +143,9 @@ class TransformerWithSae(torch.nn.Module):
         else:
             reconstructed_output = sae_output.view(bsz, seq_len, hidden_size)
 
-        reconstructed_output = output_tensor
-        # reconstructed_output = reconstructed_output.to(output_tensor_dtype)
+        reconstructed_output = reconstructed_output.to(output_tensor_dtype)
         
+        self.prefilling_stage = False
         if isinstance(output, tuple):
             return_output_tuple = (reconstructed_output,) + output[1:]
             return return_output_tuple
@@ -153,11 +171,57 @@ class TransformerWithSae(torch.nn.Module):
         self.output_module.register_forward_hook(self._output_hook_fn)
 
 
+    def _apply_intervention(self):
+        if self.intervention_config.intervention_mode == "multiply":
+            self._apply_intervention_multiply()
+        elif self.intervention_config.intervention_mode == "add" or self.intervention_config.intervention_mode == "set":
+            self._apply_intervention_add_or_set()
+
+
+    def _apply_intervention_multiply(self):
+        for intervention_index in self.intervention_config.intervention_indices:
+            mask = (self.encoder_output.sparse_feature_indices == intervention_index)
+            self.encoder_output.sparse_feature_activations[mask] *= self.intervention_config.intervention_value
+
+
+    def _apply_intervention_add_or_set(self):
+        for intervention_index in self.intervention_config.intervention_indices:
+            mask = (self.encoder_output.sparse_feature_indices == intervention_index)
+            is_ind_activated = torch.any(mask, -1)
+            if self.intervention_config.intervention_mode == "add":
+                self.encoder_output.sparse_feature_activations[mask] += self.intervention_config.intervention_value
+            elif self.intervention_config.intervention_mode == "set":
+                self.encoder_output.sparse_feature_activations[mask] = self.intervention_config.intervention_value
+            
+            # In case that the index is not selected by the TopK
+            # change the smallest value, which should be the least useful
+            if not torch.all(is_ind_activated):
+                min_val, min_ind = torch.min(self.encoder_output.sparse_feature_activations, -1)
+                token_select = torch.arange(0, len(min_ind)).to(
+                    dtype = torch.long,
+                    device = self.encoder_output.sparse_feature_activations.device
+                )
+                
+                set_val = min_val.clone()
+                set_val[~is_ind_activated] = self.intervention_config.intervention_value
+                
+                set_ind = self.encoder_output.sparse_feature_indices[token_select, min_ind]
+                set_ind[~is_ind_activated] = intervention_index
+                
+                self.encoder_output.sparse_feature_activations[token_select, min_ind] = set_val
+                self.encoder_output.sparse_feature_indices[token_select, min_ind] = set_ind
+
+
+    def update_intervention_config(self, intervention_config: InterventionConfig):
+        self.intervention_config = intervention_config
+
+
     def forward(self, *inputs, **kwargs):
+        self.prefilling_stage = True
         forward_output = self.transformer(*inputs, **kwargs)
-        self.prefilling_stage = False
         return forward_output
-    
+
+
     def generate(self, *inputs, **kwargs):
         self.prefilling_stage = True
         return self.transformer.generate(*inputs, **kwargs)
