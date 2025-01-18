@@ -103,6 +103,9 @@ class TransformerWithSae(torch.nn.Module):
         # SAE Encoding
         self.encoder_output = self.sae.encode(sae_input)
         
+        if self.intervention_config.intervention:
+            self._apply_intervention()
+        
         if self.config.output_hookpoint != self.config.input_hookpoint:
             self.prefilling_stage = False
             return
