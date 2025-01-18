@@ -65,15 +65,21 @@ class TransformerWithSae(torch.nn.Module):
         self.token_indices  = None
         self.encoder_output = None
         
+        self.prefilling_stage = True
+        
         self._register_input_hook()
         if self.config.output_hookpoint != self.config.input_hookpoint:
             self._register_output_hook()
-            
-        self.prefilling_stage = False
         
         self.intervention_config = intervention_config
         if self.intervention_config is None:
             self.intervention_config = InterventionConfig()
+
+
+    def clear_intermediates(self):
+        self.token_indices  = None
+        self.encoder_output = None
+        self.prefilling_stage = True
 
 
     def _input_hook_fn(
@@ -219,12 +225,24 @@ class TransformerWithSae(torch.nn.Module):
         self.intervention_config = intervention_config
 
 
-    def forward(self, *inputs, **kwargs):
-        self.prefilling_stage = True
+    def forward(self, return_features = False, *inputs, **kwargs):
+        self.clear_intermediates()
         forward_output = self.transformer(*inputs, **kwargs)
-        return forward_output
+        if return_features:
+            return (
+                self.encoder_output,
+                forward_output
+            )
+        else:
+            return forward_output
 
 
     def generate(self, *inputs, **kwargs):
-        self.prefilling_stage = True
+        self.clear_intermediates()
         return self.transformer.generate(*inputs, **kwargs)
+    
+    
+    def visualize(self, *inputs, **kwargs):
+        # TODO: To implemente
+        self.transformer(*inputs, **kwargs)
+        
