@@ -17,6 +17,10 @@ from .sae_utils import (
     SaeDecoderOutput, 
     SaeForwardOutput
 )
+from .sae_utils import (
+    extend_encoder_output,
+    map_tokens_to_words
+)
 from .config_utils import PretrainedSaeConfig
 from .saes.open_sae import OpenSaeConfig, OpenSae
 
@@ -56,7 +60,6 @@ class TransformerWithSae(torch.nn.Module):
             self.sae = OpenSae.from_pretrained(sae)
         else:
             self.sae = sae
-        self.config = self.sae.config
         
         self.device = device
         self.transformer.to(self.device)
@@ -64,9 +67,12 @@ class TransformerWithSae(torch.nn.Module):
         
         self.token_indices  = None
         self.encoder_output = None
+        self.saved_features = None
         
         self.prefilling_stage = True
         
+        self.forward_hook_handle = dict()
+        self.backward_hook_handle = dict()
         self._register_input_hook()
         if self.config.output_hookpoint != self.config.input_hookpoint:
             self._register_output_hook()
@@ -75,10 +81,15 @@ class TransformerWithSae(torch.nn.Module):
         if self.intervention_config is None:
             self.intervention_config = InterventionConfig()
 
+    @property
+    def config(self):
+        return self.sae.config
+
 
     def clear_intermediates(self):
         self.token_indices  = None
         self.encoder_output = None
+        self.saved_features = None
         self.prefilling_stage = True
 
 
@@ -108,6 +119,10 @@ class TransformerWithSae(torch.nn.Module):
         
         # SAE Encoding
         self.encoder_output = self.sae.encode(sae_input)
+        if self.saved_features is None:
+            self.saved_features = self.encoder_output
+        else:
+            self.saved_features = extend_encoder_output(self.saved_features, self.encoder_output)
         
         if self.intervention_config.intervention:
             self._apply_intervention()
@@ -168,7 +183,7 @@ class TransformerWithSae(torch.nn.Module):
             self.input_module = self.transformer.get_submodule(input_hookpoint)
         except:
             self.input_module = self.transformer.get_submodule("model." + input_hookpoint)
-        self.input_module.register_forward_hook(self._input_hook_fn)
+        self.forward_hook_handle[input_hookpoint] = self.input_module.register_forward_hook(self._input_hook_fn)
 
 
     def _register_output_hook(self):
@@ -177,7 +192,7 @@ class TransformerWithSae(torch.nn.Module):
             self.output_module = self.transformer.get_submodule(output_hookpoint)
         except:
             self.output_module = self.transformer.get_submodule("model." + output_hookpoint)
-        self.output_module.register_forward_hook(self._output_hook_fn)
+        self.backward_hook_handle[output_hookpoint] = self.output_module.register_forward_hook(self._output_hook_fn)
 
 
     def _apply_intervention(self):
@@ -225,8 +240,10 @@ class TransformerWithSae(torch.nn.Module):
         self.intervention_config = intervention_config
 
 
-    def forward(self, return_features = False, *inputs, **kwargs):
+    def forward(self, return_features = False, intervention_config = None, *inputs, **kwargs):
         self.clear_intermediates()
+        if intervention_config is not None:
+            self.update_intervention_config(intervention_config)
         forward_output = self.transformer(*inputs, **kwargs)
         if return_features:
             return (
@@ -237,12 +254,28 @@ class TransformerWithSae(torch.nn.Module):
             return forward_output
 
 
-    def generate(self, *inputs, **kwargs):
+    def generate(self, return_features = False, intervention_config = None, *inputs, **kwargs):
         self.clear_intermediates()
-        return self.transformer.generate(*inputs, **kwargs)
-    
-    
-    def visualize(self, *inputs, **kwargs):
-        # TODO: To implemente
-        self.transformer(*inputs, **kwargs)
+        if intervention_config is not None:
+            self.update_intervention_config(intervention_config)
         
+        generation = self.transformer.generate(*inputs, **kwargs)
+        if return_features:
+            return (
+                self.saved_features,
+                generation
+            )
+        else:
+            return generation
+
+
+    def visualize(self, *inputs, **kwargs):
+        # TODO: To implement
+        self.forward(*inputs, **kwargs)
+        # visualize self.encoder_output
+
+
+    def analyze(self, *inputs, **kwargs):
+        # TODO: To implement
+        self.forward(*inputs, **kwargs)
+        # analyze self.encoder_output

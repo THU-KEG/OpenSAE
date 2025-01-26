@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from abc import abstractmethod
 
 from transformers.utils import logging
-from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
+from transformers.modeling_utils import PreTrainedModel
 
 logging.set_verbosity_info()
 logger = logging.get_logger("sae")
@@ -86,3 +86,13 @@ def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
         return TritonDecoder.apply(top_indices, top_acts, W_dec)
     else:
         raise ImportError("Triton not installed, cannot use Triton implementation of SAE decoder. Use `torch` implementation instead.")
+
+
+def extend_encoder_output(original_encoder_output, new_encoder_output):
+    for k in original_encoder_output:
+        if k in new_encoder_output:
+            original_encoder_output[k] = torch.concat(
+                (original_encoder_output[k], new_encoder_output[k]),
+                dim = 0
+            )
+    return original_encoder_output

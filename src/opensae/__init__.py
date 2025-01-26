@@ -32,9 +32,23 @@ from setuptools_scm import get_version
 __version__ = get_version()
 
 
-from .saes import *
+from .transformer_with_sae import (
+    InterventionConfig,
+    TransformerWithSae
+)
+
+
+
+from .saes import (
+    OpenSae,
+    OpenSaeConfig,
+)
 
 
 __all__ = [
+    InterventionConfig,
+    TransformerWithSae,
     
+    OpenSae,
+    OpenSaeConfig,
 ]

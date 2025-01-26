@@ -15,7 +15,7 @@ from ...sae_utils import (
     torch_decode,
     triton_decode
 )
-from ...sparse_activation import (
+from ...sparse_activations import (
     TopK,
     JumpReLU
 )
