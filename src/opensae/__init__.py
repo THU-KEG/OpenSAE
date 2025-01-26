@@ -42,6 +42,8 @@ from .transformer_with_sae import (
 from .saes import (
     OpenSae,
     OpenSaeConfig,
+    
+    AutoSae,
 )
 
 
@@ -51,4 +53,6 @@ __all__ = [
     
     OpenSae,
     OpenSaeConfig,
+    
+    AutoSae,
 ]

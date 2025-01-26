@@ -18,11 +18,10 @@ from .sae_utils import (
     SaeForwardOutput
 )
 from .sae_utils import (
-    extend_encoder_output,
-    map_tokens_to_words
+    extend_encoder_output
 )
-from .config_utils import PretrainedSaeConfig
-from .saes.open_sae import OpenSaeConfig, OpenSae
+
+from .saes.sae_factory import AutoSae
 
 
 
@@ -57,7 +56,7 @@ class TransformerWithSae(torch.nn.Module):
             self.transformer = transformer
             
         if isinstance(sae, (Path, str)):
-            self.sae = OpenSae.from_pretrained(sae)
+            self.sae = AutoSae.from_pretrained(str(sae))
         else:
             self.sae = sae
         
