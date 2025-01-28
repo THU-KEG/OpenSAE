@@ -10,7 +10,6 @@ def colorize_token(token, activation_value, max_activation_value):
     if max_activation_value == 0:
         normalized_activation = 0
     else:
-        # Normalize the activation value to a range between 0 and 1
         normalized_activation = np.clip(activation_value / max_activation_value, 0, 1)
 
     scaled_activation = normalized_activation ** 2  
