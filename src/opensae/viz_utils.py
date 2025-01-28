@@ -13,13 +13,11 @@ def colorize_token(token, activation_value, max_activation_value):
         # Normalize the activation value to a range between 0 and 1
         normalized_activation = np.clip(activation_value / max_activation_value, 0, 1)
 
-    # Apply non-linear scaling to emphasize differences in the higher range of activation values
-    scaled_activation = normalized_activation ** 2  # Square the value to amplify differences in the higher range
+    scaled_activation = normalized_activation ** 2  
 
-    # Color gradient from light yellow (255, 255, 0) to deep red (255, 0, 0)
     red = int(255 * scaled_activation)
     green = int(255 * (1 - scaled_activation))
-    blue = 0  # Blue stays constant (for yellow-to-red transition)
+    blue = 0 
 
     # Construct the color style in RGB for HTML
     color_style = f"rgb({red}, {green}, {blue})"
