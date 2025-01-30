@@ -454,7 +454,7 @@ class SaeTrainer:
                     
                 print(avg_loss[self.train_cfg.hookpoint], avg_loss_spike_threshold) 
                 if avg_loss[self.train_cfg.hookpoint] < avg_loss_spike_threshold:
-                    self.loss_history[self.train_cfg.hookpoint].append(avg_loss[self.train_cfg.hookpoint])
+                    self.loss_history.append(avg_loss[self.train_cfg.hookpoint])
 
                 info.update(
                     {
