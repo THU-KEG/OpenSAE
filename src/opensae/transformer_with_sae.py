@@ -284,19 +284,11 @@ class TransformerWithSae(torch.nn.Module):
         batch_size, max_len = input_ids.shape
         lengths = attention_mask.sum(dim=1).tolist()
 
-        sentences = []
-        for i in range(batch_size):
-            decoded_sentence = tokenizer.decode(
-                input_ids[i], 
-            )
-            sentences.append(decoded_sentence)
 
         token_word_map_list = []
         for i in range(batch_size):
-            sentence = sentences[i]
-            map_result = refine_tokens(sentence, tokenizer)
+            map_result = refine_tokens(input_ids[i], tokenizer)
             token_word_map_list.append(map_result)     
-        filter_tokens = {"<|begin_of_text|>",}
 
         structured_data = []
         offset = 0
@@ -311,9 +303,6 @@ class TransformerWithSae(torch.nn.Module):
                     continue
 
                 token_str = token_word_map_list[i]["tokens"][t_idx]
-                if token_str in filter_tokens:
-                    offset_idx += 1 
-                    continue
 
                 base_indices = all_indices[offset + offset_idx].tolist()
                 base_acts = all_acts[offset + offset_idx].tolist()
