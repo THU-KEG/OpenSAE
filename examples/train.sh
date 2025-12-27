@@ -1,14 +1,14 @@
-export WANDB_API_KEY="YOUR WANDB API KEY"
+export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
 
 mp_size=1   # Must be 1 for now
-dp_size=`ls -al /dev/nvidia* | grep nvidia[0-9] | wc -l`
+dp_size=8
 
 exp_name=test-opensae-trainer
 
-hookpoint=layers.2
-exit_layer=2
-base_model="/MODELS/Meta-Llama-3.1-8B/"           # layer nums: 0 - 31
-dataset="/DATA/1b.mmap"
+hookpoint=layers.26
+exit_layer=26
+base_model="/app/input/Qwen3-1.7B"           # layer nums: 0 - 31
+dataset="/app/input/training.mmap"
 
 
 MODEL_CONFIG="--model ${base_model} \
@@ -29,8 +29,8 @@ TRAIN_CONFIG="
 --dp_size ${dp_size} \
 --fsdp False \
 --adam_in_8bit False \
---local_batch_size 4 \
---global_batch_size 256 \
+--local_batch_size 8 \
+--global_batch_size 512 \
 --micro_acc_steps 4 \
 --distribute_modules True \
 --save_every 200 \
@@ -49,8 +49,9 @@ TRAIN_CONFIG="
 --spike_detection_threshold_ratio 1.8 \
 --varlen True \
 --early_exit_inference_layer_num ${exit_layer} \
---log_to_wandb False \
---wandb_project SAE \
+--log_to_wandb True \
+--wandb_project SAE_FOR_QWEN3_100 \
+--wandb_log_frequency 1 \
 "
 
 
@@ -91,5 +92,5 @@ torchrun_arguments="\
 echo $torchrun_arguments
 
 
-/root/miniconda3/bin/torchrun $torchrun_arguments
+torchrun $torchrun_arguments
 
