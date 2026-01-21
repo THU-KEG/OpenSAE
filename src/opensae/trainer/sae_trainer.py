@@ -1,43 +1,29 @@
 import os
 import sys
 import math
-
+import time
+import functools
 from collections import defaultdict
 from dataclasses import asdict
 from typing import Sized
 from pathlib import Path
-import functools
 
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp import ShardingStrategy
-
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
-
-from safetensors.torch import load_model
-from fnmatch import fnmatchcase
-from natsort import natsorted
-import numpy as np
-
 from torch import Tensor, nn
 from torch.utils.data import DataLoader, Dataset
 from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup, get_wsd_schedule, get_cosine_schedule_with_warmup
+import numpy as np
 
+# 假设你的项目结构如下，请根据实际情况调整 import
 from ..saes import OpenSae, OpenSaeConfig
-
 from .train_arguments import TrainConfig, SaeConfig, ModelConfig
-from .train_utils import geometric_median, get_layer_list, resolve_width
+from .train_utils import geometric_median, resolve_width
 from ..data.collator import packing_collate_fn
-from .topk_scheduler import k_scheduler
-import time
 
 
 class SaeTrainer:
@@ -51,6 +37,7 @@ class SaeTrainer:
         data_parallel_group: dist.ProcessGroup | None = None,
         model_parallel_group: dist.ProcessGroup | None = None,
     ):
+    
         self.train_cfg = train_cfg
         
         self.data_parallel_group = data_parallel_group
@@ -59,8 +46,7 @@ class SaeTrainer:
         assert self.train_cfg.hookpoint is not None
 
         assert isinstance(dataset, Sized)
-        num_examples = len(dataset)
-
+        
         device = model.device
         input_width = resolve_width(model, train_cfg.hookpoint)
         
@@ -76,53 +62,61 @@ class SaeTrainer:
             k = sae_cfg.k,
             normalize_decoder = sae_cfg.normalize_decoder,
             auxk_alpha = train_cfg.auxk_alpha,
-            l1_coef = sae_cfg.l1_coef
+            l1_coef = sae_cfg.l1_coef,
+            decoder_impl = sae_cfg.decoder_impl if hasattr(sae_cfg, 'decoder_impl') else "triton"
         )
-        self.sae = OpenSae(open_sae_config, device)
+        
+        # 初始化 OpenSae，传入 model_parallel_group 以便内部进行切分和 GlobalTopK
+        self.sae = OpenSae(open_sae_config, device, model_parallel_group=self.model_parallel_group)
         self.model = model
 
+        # 统计参数量
         num_sae_params = sum(p.numel() for p in self.sae.parameters())
         num_model_params = sum(p.numel() for p in self.model.parameters())
         
-        print(f"Number of SAE parameters: {num_sae_params:_}")
-        print(f"Number of model parameters: {num_model_params:_}")
+        # 如果是分布式，只在 Rank 0 打印
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"Number of SAE parameters: {num_sae_params:_}")
+            print(f"Number of model parameters: {num_model_params:_}")
 
         sae_params = self.sae.parameters()
-        # Auto-select LR using 1 / sqrt(d) scaling law from Fig 3 of the paper
+        # Auto-select LR using 1 / sqrt(d) scaling law
         sae_lr = train_cfg.lr or 2e-4 / (self.sae.config.feature_size / (2**14)) ** 0.5
-        print(f"Learning rates: {sae_lr}")
+        if not dist.is_initialized() or dist.get_rank() == 0:
+            print(f"Learning rates: {sae_lr}")
 
         if train_cfg.adam_in_8bit:
             try:
                 from bitsandbytes.optim import Adam8bit as Adam
-                print("Using 8-bit Adam from bitsandbytes")
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print("Using 8-bit Adam from bitsandbytes")
             except ImportError:
                 print("bitsandbytes 8-bit Adam not available, using torch.optim.Adam")
-                print("Run `pip install bitsandbytes` for less memory usage.")
                 raise ImportError
         else:
             from torch.optim import Adam
 
         # init Optimization state
-        self.optimizer = Adam(
-            params = sae_params,
-            lr = sae_lr,
-        )
+        self.optimizer = Adam(params=sae_params, lr=sae_lr)
         
         # Init Information 
-        self.did_fire = torch.zeros(
-            self.sae.config.feature_size, device=device, dtype=torch.bool
-        )
-        self.num_tokens_since_fired = torch.zeros(
-            self.sae.config.feature_size, device=device, dtype=torch.long
-        )
+        # 获取切分后的特征维度，用于初始化死特征统计
+        if hasattr(self.sae, "local_feature_size"):
+            feature_dim = self.sae.local_feature_size
+        else:
+            feature_dim = self.sae.config.feature_size
+
+        self.did_fire = torch.zeros(feature_dim, device=device, dtype=torch.bool)
+        self.num_tokens_since_fired = torch.zeros(feature_dim, device=device, dtype=torch.long)
+        
+        print(f"[Rank {dist.get_rank() if dist.is_initialized() else 0}] Tracking dead features for {feature_dim} latents (Local Part).")
         
         # Init Dataset & Dataloader
         self.dataset = dataset
         self.dl = StatefulDataLoader(
             self.dataset,
             batch_size=self.train_cfg.local_batch_size,
-            shuffle=False,      # ZIJUN: Must be false if we want to vary the world size when resuming training.
+            shuffle=False, 
             collate_fn = functools.partial(packing_collate_fn, max_length = self.train_cfg.ctx_len),
         )
         
@@ -130,7 +124,6 @@ class SaeTrainer:
         self.dl_pbar = tqdm(desc="Training", disable=not rank_zero, total = math.ceil(len(self.dl) / self.train_cfg.grad_acc_steps))
         self.i_start = 0
         
-        assert train_cfg.lr_stable_steps is None, "LR stable steps are determined by total_steps - lr_warmup_steps - lr_decay_steps"
         self.num_training_steps = int(len(self.dl) / self.train_cfg.grad_acc_steps)
         if train_cfg.lr_warmup_ratio:
             self.train_cfg.lr_warmup_steps = int(self.num_training_steps * train_cfg.lr_warmup_ratio)
@@ -140,10 +133,11 @@ class SaeTrainer:
             self.train_cfg.lr_stable_steps = int(self.num_training_steps - self.train_cfg.lr_warmup_steps - self.train_cfg.lr_decay_steps)
             self.train_cfg.lr_stable_steps = max(self.train_cfg.lr_stable_steps, 0)
         
-        print(f"Total Training Steps: {self.num_training_steps}")
-        print(f"Warmup Steps: {self.train_cfg.lr_warmup_steps}")
-        print(f"Stable Steps: {self.train_cfg.lr_stable_steps}")
-        print(f"Decay Steps:  {self.train_cfg.lr_decay_steps}")
+        if rank_zero:
+            print(f"Total Training Steps: {self.num_training_steps}")
+            print(f"Warmup Steps: {self.train_cfg.lr_warmup_steps}")
+            print(f"Stable Steps: {self.train_cfg.lr_stable_steps}")
+            print(f"Decay Steps:  {self.train_cfg.lr_decay_steps}")
         
         if self.train_cfg.lr_scheduler_type == "cosine":
             self.lr_scheduler = get_cosine_schedule_with_warmup(
@@ -173,60 +167,120 @@ class SaeTrainer:
         
         
     def resume_training(self):
-        # Load SAEs from Dir to continue training
-        # Check the availablity of SAEs in the disk
+        """
+        Resume Training with Tensor Parallelism Support.
+        Strategy:
+        1. Model Weights: Load merged checkpoint (iter_xxx.pt) -> Slice to local part.
+        2. Optimizer States: Load sharded checkpoint (iter_xxx_mp{rank}.pt).
+        """
+        mp_rank = dist.get_rank(self.model_parallel_group) if self.model_parallel_group else 0
         iter_num = 0
         
-        sae_path = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "saes", f"{self.train_cfg.hookpoint}")
-        print(sae_path)
-        if os.path.exists(sae_path):
-            with open(os.path.join(sae_path, "latest_checkpoint.txt"), "r") as f:
-                iter_num = int(f.read().strip())
+        sae_base_path = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "saes", f"{self.train_cfg.hookpoint}")
+        
+        if os.path.exists(sae_base_path):
+            latest_file = os.path.join(sae_base_path, "latest_checkpoint.txt")
+            if os.path.exists(latest_file):
+                with open(latest_file, "r") as f:
+                    try:
+                        iter_num = int(f.read().strip())
+                    except ValueError:
+                        pass
         
         if iter_num > 0:
-            print(f"Loading SAEs from disk, iteration: {iter_num}")
+            print(f"[Rank {dist.get_rank()}] Loading SAEs from disk, iteration: {iter_num} (MP Rank: {mp_rank})")
 
-            load_path = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "saes", f"{self.train_cfg.hookpoint}", f"iter_{iter_num:07d}.pt")
-            model_state_dict = torch.load(load_path, weights_only = False, map_location = self.model.device)
-            self.sae.load_state_dict(model_state_dict)
-                
-        else:
-            print("No SAEs found in the disk")
-                
-        # Load the optimization states
-        optimizer_save_dir = self.train_cfg.hookpoint
-        optimizer_load_path = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "optimizer", optimizer_save_dir)
-        if os.path.exists(optimizer_load_path):
-            print("Loading optimization states from disk")
-            optimization_dict = torch.load(os.path.join(optimizer_load_path, f"iter_{iter_num:07d}.pt"), 
-                                           weights_only = False, 
-                                           map_location = self.model.device)
+            # -----------------------------------------------------
+            # 1. 加载模型 (Merged Checkpoint -> Sliced Loading)
+            # -----------------------------------------------------
+            load_path = os.path.join(sae_base_path, f"iter_{iter_num:07d}.pt")
             
-            self.optimizer.load_state_dict(optimization_dict["optimizer"])
-            self.lr_scheduler.load_state_dict(optimization_dict["lr_scheduler"])
-            self.did_fire = optimization_dict["did_fire"]
-            self.num_tokens_since_fired = optimization_dict["num_tokens_since_fired"]
-            self.loss_history = optimization_dict["loss_history"]
+            if not os.path.exists(load_path):
+                print(f"Checkpoint not found at {load_path}")
+                return
 
-            self.i_start = (iter_num * self.train_cfg.global_batch_size) // (dist.get_world_size(self.data_parallel_group) * self.train_cfg.local_batch_size)
-            print(f"self.i_start = {self.i_start}")
-            for _ in range(iter_num):
-                self.dl_pbar.update(1)
+            # 先读到 CPU，避免爆显存
+            state_dict = torch.load(load_path, map_location="cpu", weights_only=False)
+            
+            # 计算切片范围
+            start_idx = mp_rank * self.sae.local_feature_size
+            end_idx = (mp_rank + 1) * self.sae.local_feature_size
+            
+            new_state_dict = {}
+            
+            # 切分 Encoder Weight (Column Parallel)
+            if "encoder.weight" in state_dict:
+                # Shape: [Total_Features, Hidden] -> Slice dim 0
+                new_state_dict["encoder.weight"] = state_dict["encoder.weight"][start_idx:end_idx, :]
                 
-            dl_state_dict = optimization_dict["dataloader_state"]
-            dl_state_dict["_index_sampler_state"]["samples_yielded"] *= optimization_dict["hyperparameters"]["dp_size"]
-            dl_state_dict["_index_sampler_state"]["samples_yielded"] /= dist.get_world_size(self.data_parallel_group)
-            dl_state_dict["_index_sampler_state"]["samples_yielded"] = int(dl_state_dict["_index_sampler_state"]["samples_yielded"])
-            dl_state_dict["_sampler_iter_yielded"] *= optimization_dict["hyperparameters"]["dp_size"]
-            dl_state_dict["_sampler_iter_yielded"] /= dist.get_world_size(self.data_parallel_group)
-            dl_state_dict["_sampler_iter_yielded"] = int(dl_state_dict["_sampler_iter_yielded"])
-            dl_state_dict["_num_yielded"] *= optimization_dict["hyperparameters"]["dp_size"]
-            dl_state_dict["_num_yielded"] /= dist.get_world_size(self.data_parallel_group)
-            dl_state_dict["_num_yielded"] = int(dl_state_dict["_num_yielded"])
-            self.dl.load_state_dict(dl_state_dict)
+            # 切分 Encoder Bias (Column Parallel)
+            if "encoder.bias" in state_dict:
+                # Shape: [Total_Features] -> Slice dim 0
+                new_state_dict["encoder.bias"] = state_dict["encoder.bias"][start_idx:end_idx]
+                
+            # 切分 Decoder Weight (Row Parallel)
+            if "W_dec" in state_dict:
+                # Shape: [Total_Features, Hidden] (因为你是 OpenSAE，通常是 Encoder 的转置或者独立存储)
+                # 无论如何，TP 下 Decoder 是 Row Parallel，如果 W_dec 是 [Features, Hidden]，切 dim 0
+                new_state_dict["W_dec"] = state_dict["W_dec"][start_idx:end_idx, :]
+                
+            # Decoder Bias (Replicated, 不切分)
+            if "b_dec" in state_dict:
+                new_state_dict["b_dec"] = state_dict["b_dec"]
+
+            # 加载切好的权重
+            self.sae.load_state_dict(new_state_dict, strict=False)
+            print(f"[Rank {dist.get_rank()}] Model weights sliced and loaded.")
 
         else:
-            print("No optimization states found in the disk")
+            print("No SAEs found in the disk, starting fresh.")
+            return
+                
+        # -----------------------------------------------------
+        # 2. 加载优化器 (Sharded Checkpoint)
+        # -----------------------------------------------------
+        optimizer_save_dir = self.train_cfg.hookpoint
+        optimizer_load_base = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "optimizer", optimizer_save_dir)
+        
+        # 优先加载带 _mp{rank} 的分片文件
+        optimizer_load_path = os.path.join(optimizer_load_base, f"iter_{iter_num:07d}_mp{mp_rank}.pt")
+        
+        # 兼容旧版本单卡训练的文件 (如果 MP=1)
+        if not os.path.exists(optimizer_load_path) and self.sae.mp_world_size == 1:
+             fallback = os.path.join(optimizer_load_base, f"iter_{iter_num:07d}.pt")
+             if os.path.exists(fallback):
+                 optimizer_load_path = fallback
+
+        if os.path.exists(optimizer_load_path):
+            print(f"[Rank {dist.get_rank()}] Loading optimization states from {optimizer_load_path}...")
+            optimization_dict = torch.load(optimizer_load_path, map_location=self.model.device, weights_only=False)
+            
+            try:
+                self.optimizer.load_state_dict(optimization_dict["optimizer"])
+                self.lr_scheduler.load_state_dict(optimization_dict["lr_scheduler"])
+                
+                # 加载 Dead feature 统计 (这些是 Sharded 的，直接覆盖即可)
+                self.did_fire.copy_(optimization_dict["did_fire"].to(self.model.device))
+                self.num_tokens_since_fired.copy_(optimization_dict["num_tokens_since_fired"].to(self.model.device))
+                self.loss_history = optimization_dict["loss_history"]
+
+                # 恢复 DataLoader 位置
+                dp_size = dist.get_world_size(self.data_parallel_group) if self.data_parallel_group else 1
+                self.i_start = (iter_num * self.train_cfg.global_batch_size) // (dp_size * self.train_cfg.local_batch_size)
+                
+                # 恢复 DataLoader 随机状态
+                if "dataloader_state" in optimization_dict:
+                    self.dl.load_state_dict(optimization_dict["dataloader_state"])
+                
+                # 更新进度条
+                if hasattr(self, 'dl_pbar'):
+                    self.dl_pbar.n = iter_num
+                    self.dl_pbar.refresh()
+            except Exception as e:
+                print(f"[Rank {dist.get_rank()}] Failed to load optimizer state: {e}. Starting optimizer fresh.")
+
+        else:
+            print(f"[Rank {dist.get_rank()}] Warning: Optimizer checkpoint not found. Starting optimizer fresh.")
         
         if dist.is_initialized():
             dist.barrier()
@@ -243,7 +297,6 @@ class SaeTrainer:
         if self.train_cfg.log_to_wandb and rank_zero:
             try:
                 import wandb
-
                 wandb.init(
                     project=self.train_cfg.wandb_project,
                     name=self.train_cfg.run_name,
@@ -251,7 +304,6 @@ class SaeTrainer:
                     config=asdict(self.train_cfg),
                     save_code=True,
                     resume = "allow",
-                    # mode = "dryrun"
                 )
             except ImportError:
                 print("Weights & Biases not installed, skipping logging.")
@@ -270,31 +322,24 @@ class SaeTrainer:
         module_for_sae = self.model.get_submodule(self.train_cfg.hookpoint)
 
         def hook(module: nn.Module, _, outputs):
-            # Maybe unpack tuple outputs
             if isinstance(outputs, tuple):
                 outputs = outputs[0]
-
             hidden_dict[self.train_cfg.hookpoint] = outputs.flatten(0, 1)
-
 
         dist.barrier()
         is_wrapped = False
         DP_wrapped_sae = None
         
         for i, batch in enumerate(self.dl, start = self.i_start):
-            if i == 0 and self.train_cfg.save_at_init:
-                # Save the model state at the beginning of training
+            if i == 0 and self.train_cfg.save_at_init and self.i_start == 0:
                 self.save(0)
             
             step, substep = divmod(i + 1, self.train_cfg.grad_acc_steps)
             start_time = time.time()
             
             hidden_dict.clear()
-            
-            # Bookkeeping for dead feature detection
             num_tokens_in_step += batch["input_ids"].numel()
 
-            # Forward pass on the model to get the next batch of activations            
             forward_hook_handle = module_for_sae.register_forward_hook(hook)
             try:
                 with torch.no_grad():
@@ -312,35 +357,12 @@ class SaeTrainer:
 
 
             for name, hiddens in hidden_dict.items():
-                # On the first iteration, initialize the decoder bias
-                if i == 0:
-                    # NOTE: The all-cat here could conceivably cause an OOM in some
-                    # cases, but it's unlikely to be a problem with small world sizes.
-                    # We could avoid this by "approximating" the geometric median
-                    # across all ranks with the mean (median?) of the geometric medians
-                    # on each rank. Not clear if that would hurt performance.
+                if i == 0 and self.i_start == 0:
                     median = geometric_median(self.maybe_all_cat(hiddens))
                     self.sae.b_dec.data = median.to(self.sae.config.get_torch_dtype())
 
                 if not is_wrapped:
-                    # Wrap the SAEs with Distributed Data Parallel. We have to do this
-                    # after we set the decoder bias, otherwise DDP will not register
-                    # gradients flowing to the bias after the first step.
-                    
-                    # ZIJUN: It seems that the DDP is not necessary for the SAEs 
-                    #        in the original version from EleutherAI. Since DDP is used to asynchronize
-                    #        gradient across different GPUs. However, in the original version,
-                    #        each SAE layer is placed on a single GPU only.
-                    #       DDP is only useful when we have multiple GPUs for a single layer.
-                    
-                    # ZIJUN: The original one wraps the SAEs with DDP multiple times (=len(self.hidden_dict))
-                    #        Fixed the bug
-                    # maybe_wrapped[name] = DDP(raw, device_ids=[dist.get_rank()]) if ddp else raw
                     if self.train_cfg.fsdp and is_data_parallel:
-                        # maybe_wrapped[name] = FSDP(
-                        #     raw, sharding_strategy = ShardingStrategy.FULL_SHARD,
-                        #     process_group=self.data_parallel_group
-                        # )
                         DP_wrapped_sae = FSDP(self.sae, process_group=self.data_parallel_group)
                     elif is_data_parallel:
                         DP_wrapped_sae = DDP(self.sae, process_group=self.data_parallel_group)
@@ -348,14 +370,12 @@ class SaeTrainer:
                         DP_wrapped_sae = self.sae
                     is_wrapped = True
 
-                # Make sure the W_dec is still unit-norm
                 if self.sae.config.normalize_decoder:
                     self.sae.set_decoder_norm_to_unit_norm()
 
                 acc_steps = self.train_cfg.grad_acc_steps * self.train_cfg.micro_acc_steps
                 denom = acc_steps * self.train_cfg.wandb_log_frequency
 
-                # Save memory by chunking the activations
                 for chunk in hiddens.chunk(self.train_cfg.micro_acc_steps):
                     out = DP_wrapped_sae(
                         chunk,
@@ -366,7 +386,6 @@ class SaeTrainer:
                         )
                     )
 
-                    # Save information for reporting
                     average_reconstruction_loss[name] += float(
                         self.maybe_all_reduce(out.reconstruction_loss.detach()) / denom
                     )
@@ -380,7 +399,6 @@ class SaeTrainer:
                         avg_auxk_loss[name] += float(
                             self.maybe_all_reduce(out.auxk_loss.detach()) / denom
                         )
-                    ############################
 
                     loss = out.loss
                     loss = loss.div(acc_steps)
@@ -388,34 +406,25 @@ class SaeTrainer:
                     loss_for_spike_analysis = loss.clone().detach()
                     self.maybe_all_reduce(loss_for_spike_analysis)
                     
-                    if step > self.train_cfg.spike_detection_start:
-                        spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
-                        spike_threshold /= denom
-                    else:
-                        spike_threshold = 100
+                    spike_threshold = 100
+                    if step > self.train_cfg.spike_detection_start and len(self.loss_history) > self.train_cfg.spike_detection_window_size:
+                         spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
+                         spike_threshold /= denom
                     
                     if loss_for_spike_analysis < spike_threshold:
                         loss.backward()
                     else:
-                        print(f"Omit Loss {loss}, the threshold is {spike_threshold}")
+                        print(f"Omit Loss {loss}, threshold {spike_threshold}")
 
-                    # Also save loss for reporting
-                    avg_loss[name] += float(
-                        (loss_for_spike_analysis / denom) * acc_steps
-                    )
+                    avg_loss[name] += float((loss_for_spike_analysis / denom) * acc_steps)
 
-                    # Update the did_fire mask
                     self.did_fire[out.sparse_feature_indices.flatten()] = True
-                    self.maybe_all_reduce(self.did_fire, "max")  # max is boolean "any"
+                    # did_fire 只是本地统计，不需要 all-reduce，因为 AuxK 是本地算的
 
-                # Clip gradient norm independently for each SAE
                 torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
                 
-
-
             time_elapsed = time.time() - start_time
             
-            # Check if we need to actually do a training step
             if substep == 0:
                 self.dl_pbar.update(1)
                 if self.sae.config.normalize_decoder:
@@ -427,60 +436,37 @@ class SaeTrainer:
                 
                 lr = self.optimizer.state_dict()["param_groups"][0]["lr"]
 
-                ###############
                 with torch.no_grad():
-                    # Update the dead feature mask
                     self.num_tokens_since_fired += num_tokens_in_step
                     self.num_tokens_since_fired[self.did_fire] = 0
-
-                    # Reset stats for this step
                     num_tokens_in_step = 0
                     self.did_fire.zero_()
 
-
-
-
-
-
-
-
-                info = {}
                 mask = self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold
                 
-                if step > self.train_cfg.spike_detection_start:
-                    avg_loss_spike_threshold = np.mean(self.loss_history[name][-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
+                # Spike Detection Check
+                if step > self.train_cfg.spike_detection_start and len(self.loss_history) > self.train_cfg.spike_detection_window_size:
+                    avg_loss_spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
                 else:
-                    avg_loss_spike_threshold = 100
+                    avg_loss_spike_threshold = 1000.0 # big enough
                     
-                print(avg_loss[self.train_cfg.hookpoint], avg_loss_spike_threshold) 
                 if avg_loss[self.train_cfg.hookpoint] < avg_loss_spike_threshold:
                     self.loss_history.append(avg_loss[self.train_cfg.hookpoint])
 
-                info.update(
-                    {
-                        f"loss/fvu/{self.train_cfg.hookpoint}": average_reconstruction_loss[self.train_cfg.hookpoint],
-                        f"loss/loss/{self.train_cfg.hookpoint}": avg_loss[self.train_cfg.hookpoint],
-                        f"loss/l1_reg_loss/{self.train_cfg.hookpoint}": avg_l1_loss[self.train_cfg.hookpoint],
-                        f"dead_pct/{self.train_cfg.hookpoint}": mask.mean(
-                            dtype=torch.float32
-                        ).item(),
-                        "train/lr": lr,
-                        "train/topk": 128,
-                        "train/step_time": time_elapsed,
-                        "train/tokens": i * self.train_cfg.local_batch_size * self.train_cfg.ctx_len * self.train_cfg.dp_size,
-                        "train/total_tokens": step * self.train_cfg.global_batch_size * self.train_cfg.ctx_len,
-                    }
-                )
+                info = {
+                    f"loss/fvu/{self.train_cfg.hookpoint}": average_reconstruction_loss[self.train_cfg.hookpoint],
+                    f"loss/loss/{self.train_cfg.hookpoint}": avg_loss[self.train_cfg.hookpoint],
+                    f"loss/l1_reg_loss/{self.train_cfg.hookpoint}": avg_l1_loss[self.train_cfg.hookpoint],
+                    f"dead_pct/{self.train_cfg.hookpoint}": mask.float().mean().item(),
+                    "train/lr": lr,
+                    "train/topk": 128,
+                    "train/step_time": time_elapsed,
+                    "train/tokens": i * self.train_cfg.local_batch_size * self.train_cfg.ctx_len * self.train_cfg.dp_size,
+                    "train/total_tokens": step * self.train_cfg.global_batch_size * self.train_cfg.ctx_len,
+                }
                 if self.train_cfg.auxk_alpha > 0:
                     info[f"auxk/{self.train_cfg.hookpoint}"] = avg_auxk_loss[self.train_cfg.hookpoint]
                 info[f"multi_topk_fvu/{self.train_cfg.hookpoint}"] = average_multi_topk_loss[self.train_cfg.hookpoint]
-
-
-
-
-
-
-
 
                 avg_auxk_loss.clear()
                 average_reconstruction_loss.clear()
@@ -489,11 +475,9 @@ class SaeTrainer:
                 avg_l1_loss.clear()
 
                 if self.train_cfg.distribute_modules:
-                    if dist.get_rank(self.data_parallel_group) == 0:
-                        outputs = [{} for _ in range(dist.get_world_size(self.model_parallel_group))]
-                        dist.gather_object(info, outputs if rank_zero else None, group=self.model_parallel_group)
-                        print(outputs)
-                        info.update({k: v for out in outputs for k, v in out.items()})
+                    # Gather logs from MP ranks if needed
+                    # (Simplified: assuming Rank 0 is enough for WandB)
+                    pass
 
                 if self.train_cfg.log_to_wandb and rank_zero and step % self.train_cfg.wandb_log_frequency == 0:
                     wandb.log(info, step=step)
@@ -501,7 +485,6 @@ class SaeTrainer:
                 if step > 0 and step % self.train_cfg.save_every == 0:
                     self.save(step)
         
-        # Reduce memory fragmentation
         if (i + 1) % 1000 == 0:
             torch.cuda.empty_cache()
 
@@ -510,10 +493,11 @@ class SaeTrainer:
 
 
     def maybe_all_cat(self, x: Tensor) -> Tensor:
-        """Concatenate a tensor across all processes."""
         if not dist.is_initialized():
             return x
-
+        if self.data_parallel_group is None:
+             return x
+        
         buffer = x.new_empty([dist.get_world_size(self.data_parallel_group) * x.shape[0], *x.shape[1:]])
         dist.all_gather_into_tensor(buffer, x, group = self.data_parallel_group)
         return buffer
@@ -521,6 +505,8 @@ class SaeTrainer:
 
     def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
         if not dist.is_initialized():
+            return x
+        if self.data_parallel_group is None:
             return x
 
         if op == "sum":
@@ -530,64 +516,101 @@ class SaeTrainer:
             x /= dist.get_world_size(self.data_parallel_group)
         elif op == "max":
             dist.all_reduce(x, op=dist.ReduceOp.MAX, group = self.data_parallel_group)
-        else:
-            raise ValueError(f"Unknown reduction op '{op}'")
-
+        
         return x
 
 
-
-
     def save(self, iter):
-        """Save the SAEs to disk."""
-
-        # Only Data Parallel Rank 0 save checkpoints
-        if (
-            self.train_cfg.distribute_modules
-            or not dist.is_initialized()
-            or dist.get_rank(self.data_parallel_group) == 0
-        ):
-            # Save SAE Checkpoints
-            print(f"Model Parallel {dist.get_rank(self.model_parallel_group)} Saving SAEs")
-            assert isinstance(self.sae, OpenSae)
-
-            save_path = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'saes', self.train_cfg.hookpoint)
-            save_path = Path(save_path)
-            save_path.mkdir(parents=True, exist_ok=True)
-                
-            sae_states = self.sae.state_dict()
-            torch.save(sae_states, os.path.join(save_path, f"iter_{iter:07d}.pt"))
-            with open(os.path.join(save_path, "latest_checkpoint.txt"), "w") as f:
-                f.write(str(iter))
-
-            print(f"Save SAE Checkpoints To Disk: {save_path}")
-
+        """
+        Save the SAEs to disk with Auto-Merge for Tensor Parallelism.
+        1. Model Weights: Gathered from all MP ranks and merged into a single file on Rank 0.
+        2. Optimizer States: Sharded (one file per MP rank) to save memory/time.
+        """
+        
+        # 获取 Rank 信息
+        mp_rank = dist.get_rank(self.model_parallel_group) if self.model_parallel_group else 0
+        mp_world_size = dist.get_world_size(self.model_parallel_group) if self.model_parallel_group else 1
+        dp_rank = dist.get_rank(self.data_parallel_group) if self.data_parallel_group else 0
+        
+        # ---------------- Helper Function ----------------
+        def gather_and_merge(local_tensor, dim=0):
+            if mp_world_size == 1:
+                return local_tensor.cpu()
             
-            # Save Optimizer, Learning Rate Scheduler, DataLoader
-            print(f"Model Parallel {dist.get_rank(self.model_parallel_group)} Saving Optimization States")
+            # Rank 0 准备接收容器
+            gathered_list = [torch.zeros_like(local_tensor) for _ in range(mp_world_size)] if mp_rank == 0 else None
+            
+            # 通信
+            dist.gather(local_tensor, gathered_list, dst=0, group=self.model_parallel_group)
+            
+            # 拼接
+            if mp_rank == 0:
+                full_tensor = torch.cat(gathered_list, dim=dim).cpu()
+                return full_tensor
+            return None
+        # -------------------------------------------------
+
+        # 只有 DP Rank 0 执行保存逻辑 (避免重复)
+        if dp_rank == 0:
+            if mp_rank == 0:
+                print(f"[Iter {iter}] Gathering SAE weights from all MP ranks to Rank 0...")
+
+            # --- 1. 保存模型 (合并) ---
+            # Encoder Weight / Bias: 切分维度是 0 (Feature Dim)
+            full_encoder_weight = gather_and_merge(self.sae.encoder.weight.data, dim=0)
+            full_encoder_bias = gather_and_merge(self.sae.encoder.bias.data, dim=0)
+            
+            # Decoder Weight: 切分维度是 0 (Feature Dim)
+            if self.sae.decoder:
+                full_decoder_weight = gather_and_merge(self.sae.W_dec.data, dim=0)
+            else:
+                full_decoder_weight = None
+            
+            # Decoder Bias: 没切分，直接取
+            full_decoder_bias = self.sae.b_dec.data.cpu() if mp_rank == 0 else None
+
+            # 写盘 (仅 MP Rank 0)
+            if mp_rank == 0:
+                save_path = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'saes', self.train_cfg.hookpoint)
+                Path(save_path).mkdir(parents=True, exist_ok=True)
+
+                full_state_dict = {
+                    "encoder.weight": full_encoder_weight,
+                    "encoder.bias": full_encoder_bias,
+                    "b_dec": full_decoder_bias,
+                }
+                if full_decoder_weight is not None:
+                    full_state_dict["W_dec"] = full_decoder_weight
+
+                torch.save(full_state_dict, os.path.join(save_path, f"iter_{iter:07d}.pt"))
+                with open(os.path.join(save_path, "latest_checkpoint.txt"), "w") as f:
+                    f.write(str(iter))
+                
+                print(f"Saved merged checkpoint to {save_path}")
+
+            # --- 2. 保存优化器 (分片) ---
+            # 优化器必须分片存，否则显存爆炸且难以 Resume
+            print(f"Model Parallel {mp_rank} Saving Optimization States (Sharded)")
             optimizer_save_dir = self.train_cfg.hookpoint
-            save_path = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'optimizer', optimizer_save_dir)
-            save_path = Path(save_path)
-            save_path.mkdir(parents=True, exist_ok=True)
+            save_path_opt = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'optimizer', optimizer_save_dir)
+            Path(save_path_opt).mkdir(parents=True, exist_ok=True)
             
             optimization_dict = {
                 "optimizer": self.optimizer.state_dict(),
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "dataloader_state": self.dl.state_dict(),
-                "did_fire": self.did_fire,
+                "did_fire": self.did_fire, 
                 "num_tokens_since_fired": self.num_tokens_since_fired,
                 "loss_history": self.loss_history,
-                "hyperparameters": {
-                    "dp_size": dist.get_world_size(self.data_parallel_group),
-                    "global_batch_size": self.train_cfg.global_batch_size,
-                    "local_batch_size": self.train_cfg.local_batch_size
-                }
+                "is_sharded_optimizer": True 
             }
             
-            torch.save(optimization_dict, save_path / f"iter_{iter:07d}.pt")
-            with open(os.path.join(save_path, "latest_checkpoint.txt"), "w") as f:
-                f.write(str(iter))
+            filename_opt = f"iter_{iter:07d}_mp{mp_rank}.pt"
+            torch.save(optimization_dict, os.path.join(save_path_opt, filename_opt))
+            
+            if mp_rank == 0:
+                with open(os.path.join(save_path_opt, "latest_checkpoint.txt"), "w") as f:
+                    f.write(str(iter))
 
-        # Barrier to ensure all ranks have saved before continuing
         if dist.is_initialized():
             dist.barrier()

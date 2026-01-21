@@ -81,9 +81,9 @@ def torch_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
 
 
 # Triton implementation of SAE decoder
-def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor):
+def triton_decode(top_indices: Tensor, top_acts: Tensor, W_dec: Tensor,process_group):
     if TRITON_ENABLED:
-        return TritonDecoder.apply(top_indices, top_acts, W_dec)
+        return TritonDecoder.apply(top_indices, top_acts, W_dec,process_group)
     else:
         raise ImportError("Triton not installed, cannot use Triton implementation of SAE decoder. Use `torch` implementation instead.")
 

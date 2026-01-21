@@ -28,8 +28,7 @@ __license__ = """
     SOFTWARE.
 """
 
-from setuptools_scm import get_version
-__version__ = get_version()
+__version__ = 1.0
 
 
 from .transformer_with_sae import (

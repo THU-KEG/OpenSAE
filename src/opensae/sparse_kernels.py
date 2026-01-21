@@ -397,32 +397,59 @@ def triton_dense_dense_sparseout_matmul_kernel(
         )
 
     tl.store(out_ptr + pid * K + offsets_k, accum, mask=offsets_k < K)
+# kernels.py
 
+import torch.distributed as dist
 
 class TritonDecoder(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, sparse_indices, sparse_values, decoder_weight):
+    def forward(ctx, sparse_indices, sparse_values, decoder_weight, process_group=None):
+        # 保存上下文
+        #if dist.get_rank() == 0:
+            #print(f"DEBUG: TritonDecoder received process_group: {process_group}")
         ctx.save_for_backward(sparse_indices, sparse_values, decoder_weight)
-        return triton_sparse_dense_matmul(
+        ctx.process_group = process_group # 保存进程组以备后用（虽然backward通常不需要）
+        
+        # 1. 计算局部的重建值 (Partial Reconstruction)
+        # 形状: [Batch, d_model]
+        output_partial = triton_sparse_dense_matmul(
             sparse_indices, sparse_values, decoder_weight.T
         )
+        
+        # 2. 如果提供了进程组，执行 All-Reduce (Sum)
+        if process_group is not None and dist.get_world_size(process_group) > 1:
+            dist.all_reduce(output_partial, op=dist.ReduceOp.SUM, group=process_group)
+            
+        return output_partial
 
     @staticmethod
     def backward(ctx, grad_output):
         sparse_indices, sparse_values, decoder_weight = ctx.saved_tensors
+        process_group = ctx.process_group
 
-        assert grad_output.is_contiguous(), "grad_output must be contiguous; this is probably because the subsequent op was a .sum() or something like that, which returns a non contiguous gradient"
+        assert grad_output.is_contiguous()
 
+        # 反向传播逻辑分析：
+        # Y = Y_1 + Y_2 + ... + Y_n (All-Reduce Sum)
+        # dL/dY_i = dL/dY * 1
+        # 所以进入局部的梯度 grad_output 不需要任何通信，直接分发给所有卡即可。
+        # 这里的 grad_output 已经是全局 Loss 对全局输出的梯度。
+
+        # 1. 计算解码器权重的梯度 (dL/dW_dec)
+        # 这一步计算的是当前卡上那部分权重的梯度，所以是局部的，不需要通信。
         decoder_grad = triton_sparse_transpose_dense_matmul(
             sparse_indices, sparse_values, grad_output, N=decoder_weight.shape[1]
         ).T
 
-        return (
-            None,
-            triton_dense_dense_sparseout_matmul(
+        # 2. 计算稀疏值的梯度 (dL/d_values)
+        # 同样，使用局部的 W_dec 和全局的 grad_output 计算局部的特征梯度。
+        grad_sparse_values = triton_dense_dense_sparseout_matmul(
                 grad_output, decoder_weight, sparse_indices
-            ),
-            # decoder is contiguous when transposed so this is a matching layout
+        )
+
+        return (
+            None, # sparse_indices 没梯度
+            grad_sparse_values,
             decoder_grad,
-            None,
+            None  # process_group 没梯度
         )
