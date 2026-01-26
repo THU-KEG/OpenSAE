@@ -438,6 +438,14 @@ class SaeTrainer:
 
                 with torch.no_grad():
                     self.num_tokens_since_fired += num_tokens_in_step
+    # === [修复开始] 同步 did_fire ===
+                    # 如果使用了 DP，需要把所有 DP 组内的 did_fire 取并集 (Logical OR / MAX)
+                    if self.data_parallel_group is not None and dist.get_world_size(self.data_parallel_group) > 1:
+                        # bool 转 float/byte 才能 reduce，建议用 MAX (相当于 OR)
+                        did_fire_float = self.did_fire.float()
+                        dist.all_reduce(did_fire_float, op=dist.ReduceOp.MAX, group=self.data_parallel_group)
+                        self.did_fire = did_fire_float.bool()
+                    # === [修复结束] ===
                     self.num_tokens_since_fired[self.did_fire] = 0
                     num_tokens_in_step = 0
                     self.did_fire.zero_()

@@ -286,33 +286,34 @@ class OpenSae(PreTrainedOpenSae):
     ) -> SaeForwardOutput:
         # 1. SAE computation: hidden --> [encode] --> features --> [decode] --> reconstruction
         sae_encoder_output = self.encode(hidden, return_all_features = self.config.multi_topk)
+        
+        # [Decode] Inside here, you already did All-Reduce. 
+        # So sae_decoder_output is the FULL reconstructed vector (e.g. shape [Batch, 4096])
         sae_decoder_output = self.decode(
             sae_encoder_output.sparse_feature_indices, 
             sae_encoder_output.sparse_feature_activations,
             sae_encoder_output.input_mean,
             sae_encoder_output.input_std
         ).sae_output
-        assert sae_decoder_output.shape == hidden.shape, f"Output shape {sae_decoder_output.shape} does not match input shape {hidden.shape}"
         
+        assert sae_decoder_output.shape == hidden.shape, f"Output shape {sae_decoder_output.shape} does not match input shape {hidden.shape}"
         
         # 2. Prepare per-dimensional variance to make the training-loss stable
         per_dimension_variance = (hidden - hidden.mean(0)).pow(2).sum(0)       # size = (hidden_size,)
         per_dimension_variance = torch.clamp(per_dimension_variance, min=1.0)  # clip to ensure total_variance < 5.0
         
-        
         # 3. Compute losses
+        
         # 3.1. Reconstruction loss
+        # This loss is calculated on the full vector. It is the CORRECT global loss.
+        # DO NOT divide by mp_world_size.
         reconstruction_error, l2_loss, reconstruction_loss = self.reconstruction_loss(
             hidden = hidden, 
             hidden_variance =  per_dimension_variance, 
             sae_output = sae_decoder_output
         )
-        if self.mp_world_size > 1:
-            reconstruction_loss = reconstruction_loss / self.mp_world_size
-            # 如果你有用 l2_loss 也要除
-            l2_loss = l2_loss / self.mp_world_size
-        # 3.2. AuxK loss: help to reduce dead features.
-        # INVOKE Extra decoder pass for AuxK loss
+
+        # 3.2. AuxK loss
         if self.config.auxk_alpha > 1e-6 and dead_mask is not None and (num_dead := int(dead_mask.sum())) > 0:
             auxk_loss = self.auxk_loss(
                 hidden = hidden,
@@ -324,15 +325,17 @@ class OpenSae(PreTrainedOpenSae):
                 input_mean = sae_encoder_output.input_mean,
                 input_std = sae_encoder_output.input_std
             )
-            if self.mp_world_size > 1:
-                auxk_loss = auxk_loss / self.mp_world_size
+            # DO NOT divide by mp_world_size.
         else:
             auxk_loss = sae_decoder_output.new_tensor(0.0)
 
-        # 3.3. Multi-TopK loss: help to reduce overfitting to k
-        # INVOKE Extra decoder pass for multi-topk loss
+        # 3.3. Multi-TopK loss
         if self.config.multi_topk:
             multi_topk_feature_activations, multi_topk_feature_indices = self.multi_topk(sae_encoder_output.all_features)
+            
+            # Note: You need to make sure multi_topk also uses GlobalTopK logic if you want strict consistency,
+            # but usually multi_topk is just an auxiliary loss so Local TopK is fine.
+            
             multi_topk_sae_decoder_output = self.decode(
                 multi_topk_feature_indices, multi_topk_feature_activations,
                 sae_encoder_output.input_mean, sae_encoder_output.input_std
@@ -343,17 +346,20 @@ class OpenSae(PreTrainedOpenSae):
                 hidden_variance = per_dimension_variance, 
                 sae_output = multi_topk_sae_decoder_output
             )
-            if self.mp_world_size > 1:
-                multi_topk_loss = multi_topk_loss / self.mp_world_size
+            # DO NOT divide by mp_world_size.
         else:
             multi_topk_loss = sae_decoder_output.new_tensor(0.0)
 
 
         # 3.4. L1 loss
         l1_loss = torch.tensor(0.0, device=hidden.device)
-        if self.config.l1_coef is not None and self.cfg.l1_coef > 1e-8:
-            l1_loss = torch.norm(sae_encoder_output.all_features, p=1, dim=-1).mean() * self.cfg.l1_coef
+        if self.config.l1_coef is not None and self.config.l1_coef > 1e-8:
+            # Note: L1 loss is calculated on LOCAL features only.
+            # But since L1 is "average of absolute values", average of local parts == average of global parts
+            # (assuming uniform distribution). So this is fine.
+            l1_loss = torch.norm(sae_encoder_output.all_features, p=1, dim=-1).mean() * self.config.l1_coef
 
+        # Final Sum
         final_loss = reconstruction_loss + multi_topk_loss / 8 + auxk_loss * self.config.auxk_alpha
         if l1_loss > 1e-8:
             final_loss += l1_loss
