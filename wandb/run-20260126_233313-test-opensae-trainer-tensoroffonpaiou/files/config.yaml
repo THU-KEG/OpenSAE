@@ -1,0 +1,253 @@
+_wandb:
+    value:
+        cli_version: 0.23.1
+        e:
+            1m90o8o3fdjzaz3a460wjeu00lro0o5x:
+                args:
+                    - --model
+                    - /home/hujw/Qwen3-1.7B
+                    - --auto_model_class
+                    - AutoModel
+                    - --model.trust_remote_code
+                    - "True"
+                    - --dataset
+                    - /data/hujw/training.mmap
+                    - --split
+                    - train
+                    - --ctx_len
+                    - "4096"
+                    - --data.trust_remote_code
+                    - "True"
+                    - --hookpoint
+                    - layers.26
+                    - --mp_size
+                    - "2"
+                    - --dp_size
+                    - "2"
+                    - --fsdp
+                    - "False"
+                    - --adam_in_8bit
+                    - "False"
+                    - --local_batch_size
+                    - "8"
+                    - --global_batch_size
+                    - "256"
+                    - --micro_acc_steps
+                    - "4"
+                    - --distribute_modules
+                    - "True"
+                    - --save_every
+                    - "500"
+                    - --save_dir
+                    - /data/hujw/CHECKPOINTS
+                    - --load_dir
+                    - /data/hujw/CHECKPOINTS
+                    - --dead_feature_threshold
+                    - "10000000"
+                    - --multi_topk
+                    - "True"
+                    - --k_scheduler
+                    - constant
+                    - --k_scheduler_step_ratio
+                    - "0.1"
+                    - --auxk_alpha
+                    - "1e-2"
+                    - --lr_scheduler_type
+                    - wsd
+                    - --lr_warmup_ratio
+                    - "0.1"
+                    - --lr_decay_ratio
+                    - "0.05"
+                    - --spike_detection_start
+                    - "200000"
+                    - --spike_detection_window_size
+                    - "5"
+                    - --spike_detection_threshold_ratio
+                    - "1.8"
+                    - --varlen
+                    - "True"
+                    - --early_exit_inference_layer_num
+                    - "26"
+                    - --log_to_wandb
+                    - "True"
+                    - --wandb_project
+                    - SAE_FOR_QWEN3_9005
+                    - --wandb_log_frequency
+                    - "1"
+                    - --expansion_factor
+                    - "256"
+                    - --k
+                    - "128"
+                    - --normalize
+                    - "True"
+                    - --shift_back
+                    - "False"
+                    - --run_name
+                    - test-opensae-trainer-tensoroffonpaiou
+                cpu_count: 96
+                cpu_count_logical: 192
+                cudaVersion: "13.0"
+                disk:
+                    /:
+                        total: "468194729984"
+                        used: "301973663744"
+                email: sliverm@outlook.com
+                executable: /home/hujw/miniconda3/envs/trainqwen/bin/python3.12
+                git:
+                    commit: 35df9da3a767721e7eb880639128525134b4a379
+                    remote: git@github.com:THU-KEG/OpenSAE.git
+                gpu: NVIDIA H100 80GB HBM3
+                gpu_count: 8
+                gpu_nvidia:
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-11245bac-69ec-468f-e1b3-56d8239fa5ba
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-7d60bb73-2e1d-5632-13cd-4cbddac6e6ec
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-f22de6fc-781c-6a39-b897-35938e183407
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-1d0ffc07-3e98-cd50-40c3-70e96870e574
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-431fb366-3a9f-c85b-8338-b9c108845695
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-d0fc55e3-737c-ceea-41a8-45bef0262d76
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-b7e9b883-e67d-eedb-9c9f-0ae41ba7d428
+                    - architecture: Hopper
+                      cudaCores: 16896
+                      memoryTotal: "85520809984"
+                      name: NVIDIA H100 80GB HBM3
+                      uuid: GPU-a131237f-064d-109d-7fd6-562c61a3e388
+                host: host-172-21-88-1
+                memory:
+                    total: "2164109930496"
+                os: Linux-5.15.0-164-generic-x86_64-with-glibc2.35
+                program: -m opensae.trainer.__main__
+                python: CPython 3.12.12
+                root: /home/hujw/OpenSAE
+                startedAt: "2026-01-26T15:33:13.798432Z"
+                writerId: 1m90o8o3fdjzaz3a460wjeu00lro0o5x
+        m: []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+            "2":
+                - 1
+                - 11
+                - 41
+                - 49
+                - 51
+                - 71
+            "3":
+                - 13
+                - 14
+                - 16
+                - 61
+            "4": 3.12.12
+            "5": 0.23.1
+            "6": 4.51.0
+            "12": 0.23.1
+            "13": linux-x86_64
+adam_in_8bit:
+    value: false
+auxk_alpha:
+    value: 0.01
+dead_feature_threshold:
+    value: 10000000
+distribute_modules:
+    value: true
+dp_size:
+    value: 2
+early_exit_inference_layer_num:
+    value: 26
+fsdp:
+    value: false
+global_batch_size:
+    value: 256
+grad_acc_steps:
+    value: 16
+hookpoint:
+    value: layers.26
+k_scheduler:
+    value: constant
+k_scheduler_factor:
+    value: 4
+k_scheduler_step_ratio:
+    value: 0.1
+load_dir:
+    value: /data/hujw/CHECKPOINTS
+local_batch_size:
+    value: 8
+log_to_wandb:
+    value: true
+lr:
+    value: null
+lr_decay_ratio:
+    value: 0.05
+lr_decay_steps:
+    value: 1069
+lr_scheduler_type:
+    value: wsd
+lr_stable_steps:
+    value: 18182
+lr_warmup_ratio:
+    value: 0.1
+lr_warmup_steps:
+    value: 2139
+micro_acc_steps:
+    value: 4
+min_lr_ratio:
+    value: 0.02
+mp_size:
+    value: 2
+run_name:
+    value: test-opensae-trainer-tensoroffonpaiou
+save_at_init:
+    value: false
+save_dir:
+    value: /data/hujw/CHECKPOINTS
+save_every:
+    value: 500
+seed:
+    value: 42
+spike_detection_start:
+    value: 200000
+spike_detection_threshold_ratio:
+    value: 1.8
+spike_detection_window_size:
+    value: 5
+varlen:
+    value: true
+wandb_id:
+    value: test-opensae-trainer-tensoroffonpaiou
+wandb_log_frequency:
+    value: 1
+wandb_project:
+    value: SAE_FOR_QWEN3_9005

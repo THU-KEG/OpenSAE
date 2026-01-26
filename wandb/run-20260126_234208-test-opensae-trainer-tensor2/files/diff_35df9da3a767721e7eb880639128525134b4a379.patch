@@ -1,0 +1,433 @@
+diff --git a/examples/train.sh b/examples/train.sh
+index 82f1a53..079403c 100755
+--- a/examples/train.sh
++++ b/examples/train.sh
+@@ -1,11 +1,11 @@
+ export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
+ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ export NCCL_P2P_DISABLE=1 # (可选) 禁用 P2P 也就是 NVLink，有时候能绕过硬件 bug
+-export CUDA_VISIBLE_DEVICES=5,6,7
++export CUDA_VISIBLE_DEVICES=1,2,3,4
+ mp_size=2   # Must be 1 for now
+-dp_size=1
++dp_size=2
+ 
+-exp_name=test-opensae-trainer
++exp_name=test-opensae-trainer-tensor2
+ 
+ hookpoint=layers.26
+ exit_layer=26
+@@ -52,7 +52,7 @@ TRAIN_CONFIG="
+ --varlen True \
+ --early_exit_inference_layer_num ${exit_layer} \
+ --log_to_wandb True \
+---wandb_project SAE_FOR_QWEN3_9001 \
++--wandb_project SAE_FOR_QWEN3_9005 \
+ --wandb_log_frequency 1 \
+ "
+ 
+@@ -63,7 +63,7 @@ TRAIN_CONFIG="
+ ### Sparsity k is 128.
+ 
+ ### For eleuther AI, they use expansion_factor = 32, k = 128.
+-SAE_CONFIG="--expansion_factor 256
++SAE_CONFIG="--expansion_factor 64
+ --k 128
+ --normalize True
+ --shift_back False
+diff --git a/src/opensae/saes/open_sae/modeling_open_sae.py b/src/opensae/saes/open_sae/modeling_open_sae.py
+index 62ef46a..2ee87e2 100644
+--- a/src/opensae/saes/open_sae/modeling_open_sae.py
++++ b/src/opensae/saes/open_sae/modeling_open_sae.py
+@@ -35,25 +35,26 @@ class PreTrainedOpenSae(PreTrainedSae):
+         return
+ 
+ import torch
+-import torch.distributed as dist  # 必须引入这个
++import torch.distributed as dist
+ from torch import Tensor
+ import einops
++
+ class OpenSae(PreTrainedOpenSae):
+     def __init__(
+         self, 
+         config: OpenSaeConfig,
+         device: str | torch.device = None,
+         decoder: bool = True,
+-        model_parallel_group: dist.ProcessGroup = None,  # <--- 【修改1】增加这个参数
++        model_parallel_group: dist.ProcessGroup = None,
+         **kwargs
+     ):
+         super().__init__(config, **kwargs)
+         
+         device = torch.device("cpu") if device is None else torch.device(device)
+         self.decoder = decoder
+-        self.group = model_parallel_group  # 保存进程组
++        self.group = model_parallel_group
+         
+-        # --- 【修改2】计算当前卡的特征数 (Local Feature Size) ---
++        # --- 计算当前卡的特征数 (Local Feature Size) ---
+         self.mp_world_size = dist.get_world_size(self.group) if self.group else 1
+         self.mp_rank = dist.get_rank(self.group) if self.group else 0
+         
+@@ -64,25 +65,40 @@ class OpenSae(PreTrainedOpenSae):
+             )
+             
+         self.local_feature_size = self.config.feature_size // self.mp_world_size
+-        # -----------------------------------------------------
+ 
+-        # --- 【修改3】使用 local_feature_size 初始化 Encoder ---
++        # --- 使用 local_feature_size 初始化 Encoder (保证随机性一致) ---
++        full_encoder = torch.nn.Linear(
++            in_features=self.config.hidden_size, 
++            out_features=self.config.feature_size, 
++            bias=True)
++
++        # 手动切分权重
++        start_idx = self.mp_rank * self.local_feature_size
++        end_idx = (self.mp_rank + 1) * self.local_feature_size
++
++        with torch.no_grad():
++            local_weight = full_encoder.weight.data[start_idx:end_idx, :].clone()
++            local_bias = full_encoder.bias.data[start_idx:end_idx].clone()
++
++        # 赋值给本地 Encoder
+         self.encoder = torch.nn.Linear(
+-            in_features = self.config.hidden_size, 
+-            out_features = self.local_feature_size,  # <--- 这里改成了 local
+-            device = device, 
+-            dtype = self.config.get_torch_dtype()
++            in_features=self.config.hidden_size, 
++            out_features=self.local_feature_size,
++            device=device,
++            dtype=self.config.get_torch_dtype()
+         )
++        self.encoder.weight.data.copy_(local_weight)
++        self.encoder.bias.data.copy_(local_bias)
++
++        del full_encoder
+         self.encoder.bias.data.zero_()
+ 
+-        # --- 【修改4】使用 local_feature_size 初始化 Decoder ---
+-        # 你的 Decoder 权重是从 Encoder 克隆的，这没问题，因为它会自动继承 local shape
++        # --- 初始化 Decoder ---
+         self.W_dec = torch.nn.Parameter(self.encoder.weight.data.clone()) if self.decoder else None
+         
+         if self.decoder and self.config.normalize_decoder:
+             self.set_decoder_norm_to_unit_norm()
+             
+-        # Decoder Bias 保持完整大小 (Hidden Size)，不需要切分
+         self.b_dec = torch.nn.Parameter(
+             torch.zeros(
+                 self.config.hidden_size,
+@@ -93,40 +109,28 @@ class OpenSae(PreTrainedOpenSae):
+ 
+         self.sparse_activation = None
+         if self.config.activation == "topk":
+-            # --- 修改开始 ---
+             # 判断是否启用了 MP，如果启用了，就用 GlobalTopK
+             if self.group is not None and dist.get_world_size(self.group) > 1:
+-                # 传入 k 和 通信组
+                 self.sparse_activation = GlobalTopK(k=self.config.k, process_group=self.group)
+                 if self.config.multi_topk:
+-                # multi_topk 通常用于辅助 Loss，建议保持 Local 即可，或者同理修改
+-                    self.multi_topk = GlobalTopK(k = self.config.k * self.config.multi_topk,process_group=self.group)
+-                # 打印一下确认你用到它了
++                    self.multi_topk = GlobalTopK(k = self.config.k * self.config.multi_topk, process_group=self.group)
+                 if dist.get_rank(self.group) == 0:
+                     print(f"Algorithm: Using Global Top-K (k={self.config.k}) with Communication.")
+             else:
+-                # 单卡模式保持原样
+                 self.sparse_activation = TopK(k=self.config.k)
+                 if self.config.multi_topk:
+                     self.multi_topk=TopK(k=self.config.k*self.config.multi_topk)
+-            # --- 修改结束 ---
+-            
+ 
+         if self.config.decoder_impl == "triton":
+             self.decode_fn = triton_decode
+         elif self.config.decoder_impl == "torch":
+             self.decode_fn = torch_decode
+             
+-        # 打印调试信息
+         print(f"[Rank {self.mp_rank}] Encoder weight shape: {self.encoder.weight.shape}")
+ 
+-    # ... 下面的方法 (forward, encode, decode 等) 保持原样 ...
+-    # ... 但是在 forward 里，你的 TritonDecoder 会负责处理 all-reduce ...
+-
+     @torch.no_grad()
+     def set_decoder_norm_to_unit_norm(self):
+         assert self.W_dec is not None, "Decoder weight was not initialized."
+-
+         eps = torch.finfo(self.W_dec.dtype).eps
+         norm = torch.norm(self.W_dec.data, dim=1, keepdim=True)
+         self.W_dec.data /= norm + eps
+@@ -134,7 +138,7 @@ class OpenSae(PreTrainedOpenSae):
+     @torch.no_grad()
+     def remove_gradient_parallel_to_decoder_directions(self):
+         assert self.W_dec is not None, "Decoder weight was not initialized."
+-        assert self.W_dec.grad is not None  # keep pyright happy
++        assert self.W_dec.grad is not None 
+ 
+         parallel_component = einops.einsum(
+             self.W_dec.grad,
+@@ -157,20 +161,14 @@ class OpenSae(PreTrainedOpenSae):
+     def pre_process(self, hidden: Tensor) -> Tensor:
+         if self.config.input_normalize:
+             hidden, mu, std = self.normalization(hidden, self.config.input_normalize_eps)
+-        
+         if not self.config.normalize_shift_back:
+             mu, std = None, None
+-        
+-        # Remove decoder bias as per Anthropic
+         return hidden.to(self.b_dec.dtype) - self.b_dec, mu, std
+ 
+-
+     def encode(self, hidden: Tensor, return_all_features: bool = False) -> SaeEncoderOutput:
+         sae_input, input_mean, input_std = self.pre_process(hidden)
+         all_features = self.encoder(sae_input)
+-        # Remove negative features
+         all_features = torch.nn.functional.relu(all_features)
+-        
+         feature_activation, feature_indices = self.sparse_activation(all_features)
+         
+         return SaeEncoderOutput(
+@@ -181,7 +179,6 @@ class OpenSae(PreTrainedOpenSae):
+             input_std = input_std if self.config.input_normalize else None
+         )
+ 
+-
+     def decode(
+         self, 
+         feature_indices: Tensor, 
+@@ -191,21 +188,17 @@ class OpenSae(PreTrainedOpenSae):
+     ) -> SaeDecoderOutput:
+         assert self.W_dec is not None, "Decoder weight was not initialized."
+         if self.config.normalize_shift_back:
+-            assert input_mean is not None and input_std is not None, "Input mean and std must be provided for shift back normalization."            
++            assert input_mean is not None and input_std is not None, "Input mean/std missing."            
+ 
+         with torch.cuda.device(self.W_dec.device.index):
+-            # 【修改5】如果是 Triton 实现，确保传入 process_group
+             if self.config.decoder_impl == "triton":
+-                # 注意：这里假设你的 triton_decode 已经被修改为接受 process_group 参数
+-                # 或者你直接调用了 kernels.py 里的 TritonDecoder.apply
+                 reconstruction = self.decode_fn(
+                     feature_indices,
+                     feature_activation.to(torch.float32),
+                     self.W_dec.mT.to(torch.float32),
+-                    process_group = self.group  # <--- 必须传入这个！
++                    process_group = self.group 
+                 )
+             else:
+-                # 如果是 Torch 实现，你也需要手动做 all-reduce
+                 reconstruction = self.decode_fn(...)
+                 if self.group is not None and dist.get_world_size(self.group) > 1:
+                     dist.all_reduce(reconstruction, op=dist.ReduceOp.SUM, group=self.group)
+@@ -216,7 +209,6 @@ class OpenSae(PreTrainedOpenSae):
+ 
+         return SaeDecoderOutput(sae_output = reconstruction)
+ 
+-
+     def reconstruction_loss(
+         self,
+         hidden: Tensor,
+@@ -224,8 +216,8 @@ class OpenSae(PreTrainedOpenSae):
+         sae_output: Tensor
+     ) -> Tensor:
+         reconstruction_error = sae_output - hidden
+-        dimensional_l2_loss = reconstruction_error.pow(2).sum(0)    # size = (hidden_size,), per-dimensional L2 loss
+-        normalized_l2_loss = dimensional_l2_loss / hidden_variance  # putting everything on a reasonable scale
++        dimensional_l2_loss = reconstruction_error.pow(2).sum(0)
++        normalized_l2_loss = dimensional_l2_loss / hidden_variance
+         reconstruction_loss = torch.mean(normalized_l2_loss)
+         l2_loss = dimensional_l2_loss.mean()
+         
+@@ -235,7 +227,6 @@ class OpenSae(PreTrainedOpenSae):
+             reconstruction_loss,
+         )
+         
+-    
+     def auxk_loss(
+         self, 
+         hidden: Tensor, 
+@@ -252,27 +243,63 @@ class OpenSae(PreTrainedOpenSae):
+         if num_dead == 0:
+             return sae_output.new_tensor(0.0)
+ 
++        # 设定全局目标 k_aux (例如 2048)
++        # 即使在 TP 模式下，我们也希望总共只复活 2048 个，所以不除以 mp_world_size
++        k_aux = hidden.shape[-1] // 2 
+ 
+-        # Heuristic from Appendix B.1 in the paper
+-        k_aux = hidden.shape[-1] // 2
+-
+-        # Reduce the scale of the loss if there are a small number of dead latents
+         scale = min(num_dead / k_aux, 1.0)
+-        k_aux = min(k_aux, num_dead)
++        
++        # 如果当前卡的死特征连全局 k_aux 都不到，那就以死特征数量为上限
++        k_aux_limit = min(k_aux, num_dead)
+ 
+-        # Don't include living latents in this loss
++        # 排除活特征，设为 -inf
+         auxk_all_features = torch.where(dead_mask[None], all_features, -torch.inf)
+ 
+-        # Top-k dead latents
+-        auxk_feature_activations, auxk_feature_indices = auxk_all_features.topk(k_aux, sorted=False)
++        # 1. 本地海选：先在本地选出前 k_aux 个候选者
++        # (即使全局只需要 2048 个，我们本地也提供 2048 个最好的供全局挑选)
++        local_vals, local_inds = auxk_all_features.topk(k_aux_limit, sorted=False)
++
++        # ================== 通信筛选逻辑 (Communication Selection) ==================
++        if self.mp_world_size > 1:
++            # 2. 如果本地不足 k_aux 个，我们需要填充 padding 以便 all_gather
++            # 这一步是为了防止某些卡死特征很少，导致张量形状不一致
++            if k_aux_limit < k_aux:
++                pad_size = k_aux - k_aux_limit
++                local_vals = torch.cat([local_vals, torch.full((local_vals.shape[0], pad_size), -float('inf'), device=local_vals.device)], dim=1)
++                # indices 填充无所谓，反正值是 -inf
++                local_inds = torch.cat([local_inds, torch.zeros((local_inds.shape[0], pad_size), dtype=local_inds.dtype, device=local_inds.device)], dim=1)
++
++            # 3. 收集所有卡的候选分值
++            local_vals = local_vals.contiguous()
++            gathered_vals = [torch.zeros_like(local_vals) for _ in range(self.mp_world_size)]
++            dist.all_gather(gathered_vals, local_vals, group=self.group)
++            
++            # 4. 全局排序与划线
++            all_candidates = torch.cat(gathered_vals, dim=1) # [Batch, k_aux * mp_size]
++            # 找出全局第 k_aux 大的值
++            global_topk_vals, _ = torch.topk(all_candidates, k_aux, dim=-1)
++            threshold = global_topk_vals[:, -1].unsqueeze(1) # [Batch, 1]
++            
++            # 5. 本地过滤：只有大于等于全局阈值的才保留
++            # (注意：我们要切回原来的 k_aux_limit 长度，去掉 padding)
++            real_local_vals = local_vals[:, :k_aux_limit]
++            mask = real_local_vals >= threshold
++            
++            auxk_feature_activations = real_local_vals * mask.to(real_local_vals.dtype)
++            auxk_feature_indices = local_inds[:, :k_aux_limit]
++        else:
++            # 单卡模式
++            auxk_feature_activations = local_vals
++            auxk_feature_indices = local_inds
++        # =========================================================================
+ 
+-        # Encourage the top ~50% of dead latents to predict the residual of the
+-        # top k living latents
++        # Decode & Compute Loss
+         auxk_sae_decoder_output = self.decode(
+             auxk_feature_indices, 
+             auxk_feature_activations,
+             input_mean, input_std
+         ).sae_output
++        
+         auxk_loss = (auxk_sae_decoder_output - reconstruction_error).pow(2).sum(0)
+         auxk_loss = scale * torch.mean(auxk_loss / hidden_variance)
+         
+@@ -284,11 +311,9 @@ class OpenSae(PreTrainedOpenSae):
+         hidden: Tensor, 
+         dead_mask: Tensor | None = None
+     ) -> SaeForwardOutput:
+-        # 1. SAE computation: hidden --> [encode] --> features --> [decode] --> reconstruction
++        # 1. SAE computation
+         sae_encoder_output = self.encode(hidden, return_all_features = self.config.multi_topk)
+         
+-        # [Decode] Inside here, you already did All-Reduce. 
+-        # So sae_decoder_output is the FULL reconstructed vector (e.g. shape [Batch, 4096])
+         sae_decoder_output = self.decode(
+             sae_encoder_output.sparse_feature_indices, 
+             sae_encoder_output.sparse_feature_activations,
+@@ -296,17 +321,15 @@ class OpenSae(PreTrainedOpenSae):
+             sae_encoder_output.input_std
+         ).sae_output
+         
+-        assert sae_decoder_output.shape == hidden.shape, f"Output shape {sae_decoder_output.shape} does not match input shape {hidden.shape}"
++        assert sae_decoder_output.shape == hidden.shape, f"Output shape mismatch"
+         
+-        # 2. Prepare per-dimensional variance to make the training-loss stable
+-        per_dimension_variance = (hidden - hidden.mean(0)).pow(2).sum(0)       # size = (hidden_size,)
+-        per_dimension_variance = torch.clamp(per_dimension_variance, min=1.0)  # clip to ensure total_variance < 5.0
++        # 2. Variance
++        per_dimension_variance = (hidden - hidden.mean(0)).pow(2).sum(0)
++        per_dimension_variance = torch.clamp(per_dimension_variance, min=1.0)
+         
+         # 3. Compute losses
+         
+-        # 3.1. Reconstruction loss
+-        # This loss is calculated on the full vector. It is the CORRECT global loss.
+-        # DO NOT divide by mp_world_size.
++        # 3.1. Reconstruction loss (DO NOT DIVIDE BY MP_SIZE)
+         reconstruction_error, l2_loss, reconstruction_loss = self.reconstruction_loss(
+             hidden = hidden, 
+             hidden_variance =  per_dimension_variance, 
+@@ -325,7 +348,7 @@ class OpenSae(PreTrainedOpenSae):
+                 input_mean = sae_encoder_output.input_mean,
+                 input_std = sae_encoder_output.input_std
+             )
+-            # DO NOT divide by mp_world_size.
++            # DO NOT DIVIDE BY MP_SIZE
+         else:
+             auxk_loss = sae_decoder_output.new_tensor(0.0)
+ 
+@@ -333,9 +356,6 @@ class OpenSae(PreTrainedOpenSae):
+         if self.config.multi_topk:
+             multi_topk_feature_activations, multi_topk_feature_indices = self.multi_topk(sae_encoder_output.all_features)
+             
+-            # Note: You need to make sure multi_topk also uses GlobalTopK logic if you want strict consistency,
+-            # but usually multi_topk is just an auxiliary loss so Local TopK is fine.
+-            
+             multi_topk_sae_decoder_output = self.decode(
+                 multi_topk_feature_indices, multi_topk_feature_activations,
+                 sae_encoder_output.input_mean, sae_encoder_output.input_std
+@@ -346,32 +366,24 @@ class OpenSae(PreTrainedOpenSae):
+                 hidden_variance = per_dimension_variance, 
+                 sae_output = multi_topk_sae_decoder_output
+             )
+-            # DO NOT divide by mp_world_size.
++            # DO NOT DIVIDE BY MP_SIZE
+         else:
+             multi_topk_loss = sae_decoder_output.new_tensor(0.0)
+ 
+-
+         # 3.4. L1 loss
+         l1_loss = torch.tensor(0.0, device=hidden.device)
+         if self.config.l1_coef is not None and self.config.l1_coef > 1e-8:
+-            # Note: L1 loss is calculated on LOCAL features only.
+-            # But since L1 is "average of absolute values", average of local parts == average of global parts
+-            # (assuming uniform distribution). So this is fine.
+             l1_loss = torch.norm(sae_encoder_output.all_features, p=1, dim=-1).mean() * self.config.l1_coef
+ 
+-        # Final Sum
+         final_loss = reconstruction_loss + multi_topk_loss / 8 + auxk_loss * self.config.auxk_alpha
+         if l1_loss > 1e-8:
+             final_loss += l1_loss
+ 
+         return SaeForwardOutput(
+-            # Encoder Outputs
+             sparse_feature_activations = sae_encoder_output.sparse_feature_activations,
+             sparse_feature_indices = sae_encoder_output.sparse_feature_indices,
+             all_features = sae_encoder_output.all_features,
+-            # Decoder Outputs
+             sae_output = sae_decoder_output,
+-            # Loss Outputs
+             reconstruction_loss = reconstruction_loss,
+             multi_topk_loss = multi_topk_loss,
+             auxk_loss = auxk_loss,
+diff --git a/src/opensae/trainer/sae_trainer.py b/src/opensae/trainer/sae_trainer.py
+index 3177ae7..0311a84 100644
+--- a/src/opensae/trainer/sae_trainer.py
++++ b/src/opensae/trainer/sae_trainer.py
+@@ -418,8 +418,10 @@ class SaeTrainer:
+ 
+                     avg_loss[name] += float((loss_for_spike_analysis / denom) * acc_steps)
+ 
+-                    self.did_fire[out.sparse_feature_indices.flatten()] = True
+-                    # did_fire 只是本地统计，不需要 all-reduce，因为 AuxK 是本地算的
++                    active_mask = out.sparse_feature_activations.flatten() > 0
++                    real_active_indices = out.sparse_feature_indices.flatten()[active_mask]
++
++                    self.did_fire[real_active_indices] = True
+ 
+                 torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
+                 

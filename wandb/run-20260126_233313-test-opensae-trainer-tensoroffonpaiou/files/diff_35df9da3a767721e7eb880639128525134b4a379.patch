@@ -1,0 +1,28 @@
+diff --git a/examples/train.sh b/examples/train.sh
+index 82f1a53..de23bb8 100755
+--- a/examples/train.sh
++++ b/examples/train.sh
+@@ -1,11 +1,11 @@
+ export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
+ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+ export NCCL_P2P_DISABLE=1 # (可选) 禁用 P2P 也就是 NVLink，有时候能绕过硬件 bug
+-export CUDA_VISIBLE_DEVICES=5,6,7
++export CUDA_VISIBLE_DEVICES=1,2,3,4
+ mp_size=2   # Must be 1 for now
+-dp_size=1
++dp_size=2
+ 
+-exp_name=test-opensae-trainer
++exp_name=test-opensae-trainer-tensoroffonpaiou
+ 
+ hookpoint=layers.26
+ exit_layer=26
+@@ -52,7 +52,7 @@ TRAIN_CONFIG="
+ --varlen True \
+ --early_exit_inference_layer_num ${exit_layer} \
+ --log_to_wandb True \
+---wandb_project SAE_FOR_QWEN3_9001 \
++--wandb_project SAE_FOR_QWEN3_9005 \
+ --wandb_log_frequency 1 \
+ "
+ 

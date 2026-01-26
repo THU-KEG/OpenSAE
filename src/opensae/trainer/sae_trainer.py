@@ -418,8 +418,10 @@ class SaeTrainer:
 
                     avg_loss[name] += float((loss_for_spike_analysis / denom) * acc_steps)
 
-                    self.did_fire[out.sparse_feature_indices.flatten()] = True
-                    # did_fire 只是本地统计，不需要 all-reduce，因为 AuxK 是本地算的
+                    active_mask = out.sparse_feature_activations.flatten() > 0
+                    real_active_indices = out.sparse_feature_indices.flatten()[active_mask]
+
+                    self.did_fire[real_active_indices] = True
 
                 torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
                 
