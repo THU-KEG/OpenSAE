@@ -48,6 +48,8 @@ class TrainConfig(Serializable):
     mp_size: int = 1
     """Model Parallelism size. This means that we will train `mp_size` SAEs in parallel."""
 
+    pp_size: int = 1
+
     local_batch_size: int = 8
     """Batch size measured in sequences without gradient accumulation."""
     

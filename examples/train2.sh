@@ -1,11 +1,13 @@
 export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_P2P_DISABLE=1 # (可选) 禁用 P2P 也就是 NVLink，有时候能绕过硬件 bug
-export CUDA_VISIBLE_DEVICES=1,2,3,4
-mp_size=2   # Must be 1 for now
-dp_size=2
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
-exp_name=test-opensae-trainer-tensor-on
+mp_size=1   # Must be 1 for now
+dp_size=2
+pp_size=2
+
+exp_name=test-opensae-trainer-tensor-off
 
 hookpoint=layers.26
 exit_layer=26
@@ -29,6 +31,7 @@ TRAIN_CONFIG="
 --hookpoint ${hookpoint} \
 --mp_size ${mp_size} \
 --dp_size ${dp_size} \
+--pp_size ${pp_size} \
 --fsdp False \
 --adam_in_8bit False \
 --local_batch_size 8 \
@@ -36,8 +39,8 @@ TRAIN_CONFIG="
 --micro_acc_steps 4 \
 --distribute_modules True \
 --save_every 500 \
---save_dir /data/hujw/CHECKPOINTS \
---load_dir /data/hujw/CHECKPOINTS \
+--save_dir /data/hujw/CHECKPOINTS9 \
+--load_dir /data/hujw/CHECKPOINTS9 \
 --dead_feature_threshold 10000000 \
 --multi_topk True \
 --k_scheduler constant \
@@ -52,7 +55,7 @@ TRAIN_CONFIG="
 --varlen True \
 --early_exit_inference_layer_num ${exit_layer} \
 --log_to_wandb True \
---wandb_project SAE_FOR_QWEN3_9009 \
+--wandb_project SAE_FOR_QWEN3_9025 \
 --wandb_log_frequency 1 \
 "
 
@@ -63,7 +66,7 @@ TRAIN_CONFIG="
 ### Sparsity k is 128.
 
 ### For eleuther AI, they use expansion_factor = 32, k = 128.
-SAE_CONFIG="--expansion_factor 64
+SAE_CONFIG="--expansion_factor 48
 --k 128
 --normalize True
 --shift_back False
@@ -85,7 +88,7 @@ export CUBLAS_WORKSPACE_CONFIG=":4096:8"
 
 torchrun_arguments="\
     --nproc_per_node $((mp_size * dp_size*pp_size)) \
-    --master-port $((10000 + $RANDOM % 100)) \
+    --master-port 10045 \
     -m opensae.trainer \
         ${MODEL_CONFIG} ${DATA_CONFIG} \
         ${TRAIN_CONFIG} ${SAE_CONFIG} \

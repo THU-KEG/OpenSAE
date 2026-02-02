@@ -3,7 +3,7 @@ from contextlib import nullcontext, redirect_stdout
 from dataclasses import dataclass
 from multiprocessing import cpu_count
 from pathlib import Path
-
+import math
 
 import numpy as np
 import random
@@ -12,7 +12,7 @@ import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
 from datasets import Dataset, load_dataset
 from simple_parsing import field, parse, ArgumentParser
-from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizer
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig, PreTrainedModel, PreTrainedTokenizer,AutoConfig
 
 # 假设这些模块你已经有了
 from .train_arguments import SaeConfig, TrainConfig, ModelConfig, DataConfig
@@ -92,127 +92,173 @@ def set_seed(seed: int):
     torch.use_deterministic_algorithms(True)
     np.random.seed(seed)
     random.seed(seed)
+def load_model_pipeline(args, rank: int, pp_rank: int, pp_size: int, mp_rank: int) -> torch.nn.Module:
+    """
+    工业级加载：基于 Early Exit 层数进行动态均衡切分。
+    逻辑：
+    1. 计算有效层数 (Effective Layers) = min(Total Layers, Exit Layer + 1)
+    2. 将有效层数均匀分配给 PP Stages。
+    3. 每个 Rank 只加载自己负责的那部分层到显存，其余留在 CPU 或释放。
+    """
+    model_path = args.model.model
+    config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
     
+    # === 1. 计算切分范围 (Slicing Logic) ===
+    full_model_layers = config.num_hidden_layers
+    
+    # 获取用户设置的退出层 (默认为最后一层)
+    # 务必确保 train_arguments.py 里有 early_exit_inference_layer_num
+    exit_layer_idx = getattr(args.train, "early_exit_inference_layer_num", full_model_layers - 1)
+    
+    # 有效总层数：比如 exit=26，则我们需要跑 0-26 共 27 层
+    target_layers = exit_layer_idx + 1
+    effective_num_layers = min(target_layers, full_model_layers)
+    
+    # 计算每个 Stage 分到的层数 (向上取整)
+    # 例如：Effective=27, PP=2 => ceil(13.5) = 14 层/stage
+    layers_per_stage = math.ceil(effective_num_layers / pp_size)
+    
+    # 当前 Rank 的负责范围 [start, end)
+    start_layer = pp_rank * layers_per_stage
+    # 结束点不能超过有效总层数
+    end_layer = min((pp_rank + 1) * layers_per_stage, effective_num_layers)
+    
+    # 打印调试信息
+    if start_layer >= effective_num_layers:
+        print(f"[Rank {rank}] PP-Rank {pp_rank}: IDLE (Start {start_layer} >= Effective Total {effective_num_layers})")
+        # 即使空转也需要实例化模型结构，防止 DDP 初始化失败
+    else:
+        print(f"[Rank {rank}] PP-Rank {pp_rank}: Active Range [{start_layer}, {end_layer - 1}] "
+              f"(Allocated {end_layer - start_layer} layers from total effective {effective_num_layers})")
 
+    # === 2. 加载模型骨架 (Load Skeleton) ===
+    # device_map="cpu" 极其重要，防止 full load 爆显存
+    print(f"[Rank {rank}] Loading model weights to CPU...")
+    model = args.model.auto_model_class.from_pretrained(
+        model_path,
+        torch_dtype="auto",
+        trust_remote_code=True,
+        device_map="cpu" 
+    )
+    model.eval()
+    model.requires_grad_(False)
+    
+    device = torch.device(f"cuda:{rank}")
+    
+    def safe_to(module, device):
+        if module is not None:
+            module.to(device)
+
+    # === 3. 按需移动到 GPU (Move to GPU) ===
+    
+    # 3.1 Embeddings: 只有 PP Rank 0 需要
+    if pp_rank == 0:
+        print(f"[Rank {rank}] Moving Embeddings to GPU")
+        safe_to(getattr(model, "embed_tokens", None), device)
+    
+    # 3.2 Layers: 只移动负责范围内的层
+    if hasattr(model, "layers"):
+        # 我们可以选择释放掉不需要的层以节省 CPU 内存，但在 PP 这种规模下通常不需要
+        # 这里只做 .to(device)
+        for i in range(start_layer, end_layer):
+            print(f"[Rank {rank}] Moving Layer {i} to GPU")
+            model.layers[i].to(device)
+            
+    # 3.3 Final Norm & Head: 只有负责“最后一层有效层”的 Rank 需要
+    # 逻辑：如果这个 Rank 的 range 包含了 effective_num_layers - 1，那它就是最后一棒
+    last_effective_layer_idx = effective_num_layers - 1
+    if start_layer <= last_effective_layer_idx < end_layer:
+        print(f"[Rank {rank}] Moving Final Norm & Head to GPU (Responsible for output)")
+        safe_to(getattr(model, "norm", None), device)
+
+    # === 4. 清理缓存 ===
+    torch.cuda.empty_cache()
+    
+    return model
 def run():
-    local_rank = os.environ.get("LOCAL_RANK")
-    is_distributed_training = local_rank is not None
-    rank = int(local_rank) if is_distributed_training else 0
-    
-    # 绑定当前进程到指定 GPU，这对 device_mesh 初始化很重要
-    if is_distributed_training:
-        torch.cuda.set_device(rank)
-
     parser = ArgumentParser()
-    parser.add_arguments(SaeConfig, dest = "sae")
-    parser.add_arguments(ModelConfig, dest = "model")
-    parser.add_arguments(DataConfig, dest = "data")
-    parser.add_arguments(TrainConfig, dest = "train")
-    
+    parser.add_arguments(SaeConfig, dest="sae")
+    parser.add_arguments(ModelConfig, dest="model")
+    parser.add_arguments(DataConfig, dest="data")
+    parser.add_arguments(TrainConfig, dest="train")
     args = parser.parse_args()
-    # 兼容性处理
     model_args = args.model
     data_args = args.data
     train_args = args.train
     sae_args = args.sae
     train_args.ctx_len = data_args.ctx_len
+    # 设置种子
+    torch.manual_seed(args.train.seed)
     
-    set_seed(train_args.seed)
-    
-    data_parallel_group = None
-    model_parallel_group = None
-    
-    if is_distributed_training:
-        dist.init_process_group(backend="nccl")
-        world_size = dist.get_world_size()
-        
-        # 【关键检查】确保 DP * MP = World Size
-        assert train_args.dp_size * train_args.mp_size == world_size, \
-            f"DP Size ({train_args.dp_size}) * MP Size ({train_args.mp_size}) != World Size ({world_size})"
+    # 分布式初始化
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    torch.cuda.set_device(local_rank)
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
-        # 初始化 Device Mesh
-        # 假设 mesh 形状是 (dp, mp)。
-        # 第一维是 data_parallel (在这一维上做数据切分)
-        # 第二维是 model_parallel (在这一维上做模型切分)
-        device_mesh = init_device_mesh("cuda", (train_args.dp_size, train_args.mp_size), mesh_dim_names=("data_parallel", "model_parallel"))
-        
-        data_parallel_group = device_mesh.get_group(mesh_dim="data_parallel")
-        model_parallel_group = device_mesh.get_group(mesh_dim="model_parallel")
-        
-        if rank == 0:
-            print_rank_0(f"Using Parallel across {world_size} GPUs.")
-            print_rank_0(f"Data Parallel Group Size: {dist.get_world_size(data_parallel_group)}")
-            print_rank_0(f"Model Parallel Group Size: {dist.get_world_size(model_parallel_group)}")
-
-    tokenizer = load_tokenizer(model_args)
-    # 所有卡都加载完整的 LLM
-    model = load_model(args, tokenizer, rank)
-
-    # 【关键数据逻辑】
-    # 1. dataset_world_size: 决定把数据切成几份。应该等于 DP Size。
-    # 2. dataset_rank: 决定当前进程拿哪一份数据。
-    # 
-    # Device Mesh 逻辑验证：
-    # 假设 4 卡，DP=2, MP=2。
-    # Mesh: [[0, 1], [2, 3]]
-    # Data Parallel Group (纵向): [0, 2], [1, 3]
-    # Model Parallel Group (横向): [0, 1], [2, 3]
-    #
-    # 对于 Rank 0 (在组 [0, 2] 中): rank_in_group = 0
-    # 对于 Rank 1 (在组 [1, 3] 中): rank_in_group = 0
-    # -> 结论：Rank 0 和 Rank 1 拿到了相同的数据切片 (Slice 0)。这是正确的！因为它们是 MP 关系。
-    #
-    # 对于 Rank 2 (在组 [0, 2] 中): rank_in_group = 1
-    # 对于 Rank 3 (在组 [1, 3] 中): rank_in_group = 1
-    # -> 结论：Rank 2 和 Rank 3 拿到了相同的数据切片 (Slice 1)。
-    #
-    # 最终：(0,1) 合作训练 Slice 0，(2,3) 合作训练 Slice 1。逻辑完美闭环。
+    # 3D Device Mesh: (DP, PP, MP)
+    # 假设 8 卡: DP=2, PP=2, MP=2
+    # mesh 形状: (2, 2, 2)
+    expected_ws = args.train.dp_size * args.train.pp_size * args.train.mp_size
+    assert world_size == expected_ws, f"World Size {world_size} != DP*PP*MP ({expected_ws})"
     
-    dataset_world_size = 1
-    dataset_rank = 0
-    if is_distributed_training:
-        dataset_world_size = dist.get_world_size(data_parallel_group)
-        dataset_rank = dist.get_rank(data_parallel_group)
-        
+    device_mesh = init_device_mesh(
+        "cuda", 
+        (args.train.dp_size, args.train.pp_size, args.train.mp_size), 
+        mesh_dim_names=("dp", "pp", "mp")
+    )
+    
+    if rank == 0:
+        print(f"Device Mesh Initialized: {device_mesh}")
+
+    # 获取子组
+    dp_group = device_mesh.get_group(mesh_dim="dp")
+    pp_group = device_mesh.get_group(mesh_dim="pp")
+    mp_group = device_mesh.get_group(mesh_dim="mp")
+
+    # 当前进程在各维度的 Rank
+    pp_rank = dist.get_rank(pp_group)
+    mp_rank = dist.get_rank(mp_group)
+    
+    # 加载 Tokenizer
+    tokenizer = AutoModel.from_pretrained(args.model.model, trust_remote_code=True).tokenizer if hasattr(AutoModel.from_pretrained(args.model.model, trust_remote_code=True), 'tokenizer') else None 
+    # 修正: 上面这行写法不好，直接加载 tokenizer
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(args.model.model, trust_remote_code=True)
+
+    # 加载部分模型 (Pipeline Parallel Loading)
+    model = load_model_pipeline(args, rank, pp_rank, args.train.pp_size, mp_rank)
+
+    # Dataset 分片
+    # 注意：在我们的架构中，整个 PP 组 + TP 组共享同一个 Batch。
+    # 只有 DP 组之间数据不同。
+    dataset_world_size = dist.get_world_size(dp_group)
+    dataset_rank = dist.get_rank(dp_group)
+    
     dataset = DistributedTokenizedDataset(
-        path = data_args.dataset,
-        tokenizer = tokenizer,
-        seq_length = data_args.ctx_len,
-        current_rank = dataset_rank, # 这里的 Rank 是 DP 组内的 Rank
-        world_size = dataset_world_size # 这里的 Size 是 DP 组的大小
+        path=args.data.dataset,
+        tokenizer=tokenizer,
+        seq_length=args.data.ctx_len,
+        current_rank=dataset_rank,
+        world_size=dataset_world_size
     )
 
-    # 日志文件处理
-    log_dir = Path("logs") / f"{train_args.run_name}"
-    log_dir.mkdir(parents=True, exist_ok=True)
+    # 初始化 Trainer
+    trainer = SaeTrainer(
+        train_cfg=train_args,
+        sae_cfg=args.sae,
+        model_cfg=args.model,
+        dataset=dataset,
+        model=model,
+        device_mesh=device_mesh, # 传入 mesh 方便管理
+        data_parallel_group=dp_group,
+        model_parallel_group=mp_group,
+        pipeline_parallel_group=pp_group
+    )
     
-    # 标记 MP rank 和 DP rank 便于调试
-    dp_rank = dist.get_rank(data_parallel_group) if is_distributed_training else 0
-    mp_rank = dist.get_rank(model_parallel_group) if is_distributed_training else 0
-    
-    log_file = log_dir / f"dp{dp_rank}-mp{mp_rank}.log"
-    log_file.touch(exist_ok = True)
-    
-    # 只有总 Rank 0 打印到控制台，其他输出到文件
-    # 注意：在 TP 中，最好偶尔检查一下所有 Rank 的日志，确保没有死锁
-    with nullcontext() if rank == 0 else redirect_stdout(open(str(log_file), "w")):
-        print(f"Training on '{data_args.dataset}'")
-        print(f"Global Rank: {rank} | DP Rank: {dp_rank} | MP Rank: {mp_rank}")
-        print(f"Model Parallel Group: {model_parallel_group}")
-
-        trainer = SaeTrainer(
-            train_cfg=train_args, 
-            sae_cfg=sae_args, 
-            model_cfg=model_args, 
-            dataset=dataset, 
-            model=model, 
-            data_parallel_group=data_parallel_group, 
-            model_parallel_group=model_parallel_group # 传入 MP 组
-        )
-        trainer.fit()
-
-    if is_distributed_training:
-        dist.destroy_process_group()
+    trainer.fit()
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     run()

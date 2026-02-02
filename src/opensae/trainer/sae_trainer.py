@@ -7,7 +7,7 @@ from collections import defaultdict
 from dataclasses import asdict
 from typing import Sized
 from pathlib import Path
-
+from transformers.modeling_attn_mask_utils import _prepare_4d_causal_attention_mask
 import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup, get_wsd_schedule, get_cosine_schedule_with_warmup
 import numpy as np
 
-# 假设你的项目结构如下，请根据实际情况调整 import
+# 假设你的项目结构如下
 from ..saes import OpenSae, OpenSaeConfig
 from .train_arguments import TrainConfig, SaeConfig, ModelConfig
 from .train_utils import geometric_median, resolve_width
@@ -36,19 +36,53 @@ class SaeTrainer:
         model: PreTrainedModel,
         data_parallel_group: dist.ProcessGroup | None = None,
         model_parallel_group: dist.ProcessGroup | None = None,
+        pipeline_parallel_group: dist.ProcessGroup | None = None, # [新增] PP 组
+        device_mesh = None # [新增] Device Mesh (可选)
     ):
     
         self.train_cfg = train_cfg
-        
+
         self.data_parallel_group = data_parallel_group
         self.model_parallel_group = model_parallel_group
+        self.pipeline_parallel_group = pipeline_parallel_group # [新增]
+        self.device_mesh = device_mesh
+
+        # [新增] PP 相关参数
+        self.pp_group = pipeline_parallel_group
+        self.pp_rank = dist.get_rank(self.pp_group) if self.pp_group else 0
+        self.pp_size = dist.get_world_size(self.pp_group) if self.pp_group else 1
+        
+        # === [修改开始] ===
+        # 必须与 main.py 的切分逻辑完全一致
+        full_model_layers = model.config.num_hidden_layers
+        # 注意：这里要确保 train_cfg 里有 early_exit_inference_layer_num
+        target_layers = train_cfg.early_exit_inference_layer_num + 1
+        effective_num_layers = min(target_layers, full_model_layers)
+        
+        layers_per_stage = math.ceil(effective_num_layers / self.pp_size)
+        
+        self.my_start_layer = self.pp_rank * layers_per_stage
+        self.my_end_layer = min((self.pp_rank + 1) * layers_per_stage, effective_num_layers)
+        # === [修改结束] ===
+
+        # [新增] 解析 Hookpoint 位置
+        target_layer_name = train_cfg.hookpoint # e.g., "layers.26"
+        try:
+            self.target_layer_idx = int(target_layer_name.split('.')[1])
+        except:
+             print(f"Warning: Could not parse layer index from {train_cfg.hookpoint}")
+             self.target_layer_idx = -1
+             
+        # [新增] 判断 Hookpoint 归谁管
+        self.hook_owner_pp_rank = self.target_layer_idx // layers_per_stage
+        if self.hook_owner_pp_rank >= self.pp_size:
+            self.hook_owner_pp_rank = self.pp_size - 1
 
         assert self.train_cfg.hookpoint is not None
-
         assert isinstance(dataset, Sized)
         
-        device = model.device
-        input_width = resolve_width(model, train_cfg.hookpoint)
+        device = torch.device("cuda", torch.cuda.current_device())
+        input_width = model.config.hidden_size
         
         open_sae_config = OpenSaeConfig(
             hidden_size = input_width,
@@ -72,12 +106,12 @@ class SaeTrainer:
 
         # 统计参数量
         num_sae_params = sum(p.numel() for p in self.sae.parameters())
-        num_model_params = sum(p.numel() for p in self.model.parameters())
+        # LLM 参数量统计可能不准确（因为只加载了部分层），但不影响运行
         
         # 如果是分布式，只在 Rank 0 打印
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"Number of SAE parameters: {num_sae_params:_}")
-            print(f"Number of model parameters: {num_model_params:_}")
+            print(f"PP Rank {self.pp_rank} responsible for layers {self.my_start_layer} - {self.my_end_layer}")
 
         sae_params = self.sae.parameters()
         # Auto-select LR using 1 / sqrt(d) scaling law
@@ -118,6 +152,7 @@ class SaeTrainer:
             batch_size=self.train_cfg.local_batch_size,
             shuffle=False, 
             collate_fn = functools.partial(packing_collate_fn, max_length = self.train_cfg.ctx_len),
+            drop_last=True
         )
         
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
@@ -159,19 +194,22 @@ class SaeTrainer:
                 num_warmup_steps = self.train_cfg.lr_warmup_steps, 
                 num_training_steps = self.num_training_steps
             )
+        # 兜底 constant
+        else:
+            self.lr_scheduler = get_linear_schedule_with_warmup(
+                self.optimizer, num_warmup_steps=0, num_training_steps=self.num_training_steps
+            )
         
         self.loss_history = list()
         
         if train_cfg.load_dir is not None:
             self.resume_training()
-        
-        
+        print(f"[Rank {dist.get_rank()}] Hookpoint: {train_cfg.hookpoint} -> Parsed Index: {self.target_layer_idx} (Owner PP Rank: {self.hook_owner_pp_rank})")
+
+    # [保留原样] 你的 Resume 逻辑非常完善，不需要修改
     def resume_training(self):
         """
         Resume Training with Tensor Parallelism Support.
-        Strategy:
-        1. Model Weights: Load merged checkpoint (iter_xxx.pt) -> Slice to local part.
-        2. Optimizer States: Load sharded checkpoint (iter_xxx_mp{rank}.pt).
         """
         mp_rank = dist.get_rank(self.model_parallel_group) if self.model_parallel_group else 0
         iter_num = 0
@@ -189,63 +227,35 @@ class SaeTrainer:
         
         if iter_num > 0:
             print(f"[Rank {dist.get_rank()}] Loading SAEs from disk, iteration: {iter_num} (MP Rank: {mp_rank})")
-
-            # -----------------------------------------------------
-            # 1. 加载模型 (Merged Checkpoint -> Sliced Loading)
-            # -----------------------------------------------------
             load_path = os.path.join(sae_base_path, f"iter_{iter_num:07d}.pt")
             
             if not os.path.exists(load_path):
                 print(f"Checkpoint not found at {load_path}")
                 return
 
-            # 先读到 CPU，避免爆显存
             state_dict = torch.load(load_path, map_location="cpu", weights_only=False)
-            
-            # 计算切片范围
             start_idx = mp_rank * self.sae.local_feature_size
             end_idx = (mp_rank + 1) * self.sae.local_feature_size
-            
             new_state_dict = {}
-            
-            # 切分 Encoder Weight (Column Parallel)
             if "encoder.weight" in state_dict:
-                # Shape: [Total_Features, Hidden] -> Slice dim 0
                 new_state_dict["encoder.weight"] = state_dict["encoder.weight"][start_idx:end_idx, :]
-                
-            # 切分 Encoder Bias (Column Parallel)
             if "encoder.bias" in state_dict:
-                # Shape: [Total_Features] -> Slice dim 0
                 new_state_dict["encoder.bias"] = state_dict["encoder.bias"][start_idx:end_idx]
-                
-            # 切分 Decoder Weight (Row Parallel)
             if "W_dec" in state_dict:
-                # Shape: [Total_Features, Hidden] (因为你是 OpenSAE，通常是 Encoder 的转置或者独立存储)
-                # 无论如何，TP 下 Decoder 是 Row Parallel，如果 W_dec 是 [Features, Hidden]，切 dim 0
                 new_state_dict["W_dec"] = state_dict["W_dec"][start_idx:end_idx, :]
-                
-            # Decoder Bias (Replicated, 不切分)
             if "b_dec" in state_dict:
                 new_state_dict["b_dec"] = state_dict["b_dec"]
 
-            # 加载切好的权重
             self.sae.load_state_dict(new_state_dict, strict=False)
             print(f"[Rank {dist.get_rank()}] Model weights sliced and loaded.")
-
         else:
             print("No SAEs found in the disk, starting fresh.")
             return
                 
-        # -----------------------------------------------------
-        # 2. 加载优化器 (Sharded Checkpoint)
-        # -----------------------------------------------------
         optimizer_save_dir = self.train_cfg.hookpoint
         optimizer_load_base = os.path.join(self.train_cfg.load_dir, self.train_cfg.run_name, "optimizer", optimizer_save_dir)
-        
-        # 优先加载带 _mp{rank} 的分片文件
         optimizer_load_path = os.path.join(optimizer_load_base, f"iter_{iter_num:07d}_mp{mp_rank}.pt")
         
-        # 兼容旧版本单卡训练的文件 (如果 MP=1)
         if not os.path.exists(optimizer_load_path) and self.sae.mp_world_size == 1:
              fallback = os.path.join(optimizer_load_base, f"iter_{iter_num:07d}.pt")
              if os.path.exists(fallback):
@@ -254,46 +264,141 @@ class SaeTrainer:
         if os.path.exists(optimizer_load_path):
             print(f"[Rank {dist.get_rank()}] Loading optimization states from {optimizer_load_path}...")
             optimization_dict = torch.load(optimizer_load_path, map_location=self.model.device, weights_only=False)
-            
             try:
                 self.optimizer.load_state_dict(optimization_dict["optimizer"])
                 self.lr_scheduler.load_state_dict(optimization_dict["lr_scheduler"])
-                
-                # 加载 Dead feature 统计 (这些是 Sharded 的，直接覆盖即可)
                 self.did_fire.copy_(optimization_dict["did_fire"].to(self.model.device))
                 self.num_tokens_since_fired.copy_(optimization_dict["num_tokens_since_fired"].to(self.model.device))
                 self.loss_history = optimization_dict["loss_history"]
 
-                # 恢复 DataLoader 位置
                 dp_size = dist.get_world_size(self.data_parallel_group) if self.data_parallel_group else 1
                 self.i_start = (iter_num * self.train_cfg.global_batch_size) // (dp_size * self.train_cfg.local_batch_size)
                 
-                # 恢复 DataLoader 随机状态
                 if "dataloader_state" in optimization_dict:
                     self.dl.load_state_dict(optimization_dict["dataloader_state"])
-                
-                # 更新进度条
                 if hasattr(self, 'dl_pbar'):
                     self.dl_pbar.n = iter_num
                     self.dl_pbar.refresh()
             except Exception as e:
                 print(f"[Rank {dist.get_rank()}] Failed to load optimizer state: {e}. Starting optimizer fresh.")
-
         else:
             print(f"[Rank {dist.get_rank()}] Warning: Optimizer checkpoint not found. Starting optimizer fresh.")
         
         if dist.is_initialized():
             dist.barrier()
+    def pipeline_forward(self, batch):
+        """
+        手动执行 Pipeline Forward。
+        返回: 如果当前 rank 是 hook rank，返回 activation Tensor；否则返回 None。
+        """
+        input_ids = batch["input_ids"]
+        device = torch.device("cuda", torch.cuda.current_device())
+        hidden_state = None
+        
+        # 获取 Batch 和 Seq Len
+        if input_ids.dim() == 2:
+            batch_size, seq_len = input_ids.shape
+        else:
+            batch_size = 1 
+            seq_len = input_ids.shape[0]
+        attention_mask=batch.get("attention_mask",None)
+        if attention_mask is None:
+            attention_mask=torch.ones((batch_size,seq_len),device=device,dtype=torch.bool)
+        else:
+            attention_mask=attention_mask.to(device)
+        dummy_embeds=torch.empty((batch_size,seq_len,self.model.config.hidden_size),dtype=self.model.dtype,device=device)
+        extended_attention_mask=_prepare_4d_causal_attention_mask(
+            attention_mask,
+            (batch_size,seq_len),
+            dummy_embeds,
+            past_key_values_length=0
+        )
+        # === 1. PP Rank 0: Embedding ===
+        if self.pp_rank == 0:
+            input_ids = input_ids.to(device)
+            hidden_state = self.model.embed_tokens(input_ids)
+        else:
+            # 接收上一个 Rank 的 Tensor
+            hidden_dim = self.model.config.hidden_size
+            if input_ids.dim() == 2:
+                recv_shape = (batch_size, seq_len, hidden_dim)
+            else:
+                recv_shape = (seq_len, hidden_dim)
+                
+            hidden_state = torch.zeros(recv_shape, device=device, dtype=self.model.dtype)
+            src_rank = dist.get_global_rank(self.pp_group, self.pp_rank - 1)
+            dist.recv(hidden_state, src=src_rank, group=self.pp_group)
 
 
+
+        # === 2. 准备 Position IDs 和 Rotary Embeddings ===
+        
+        # 2.1 生成 Position IDs
+        if "position_ids" in batch:
+            position_ids = batch["position_ids"].to(device)
+        else:
+            position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+            if input_ids.dim() == 2:
+                position_ids = position_ids.repeat(batch_size, 1)
+
+        # 2.2 计算 Rotary Embeddings (cos, sin)
+        rotary_emb = self.model.rotary_emb
+        
+        # [修改] 强制使用 position_ids 调用
+        cos, sin = rotary_emb(hidden_state, position_ids)
+            
+        position_embeddings = (cos, sin)
+
+
+        # === 3. Run Local Layers ===
+        target_activation = None
+        
+        for i in range(self.my_start_layer, self.my_end_layer):
+            if i >= len(self.model.layers): break
+            
+            layer = self.model.layers[i]
+            
+            layer_out = layer(
+                hidden_state, 
+                attention_mask=extended_attention_mask,
+                position_ids=position_ids,
+                position_embeddings=position_embeddings,
+            )[0]
+            
+            hidden_state = layer_out
+            
+            if i == self.target_layer_idx:
+                target_activation = hidden_state.detach().clone()
+        
+        # === 4. Send to Next Rank ===
+        if self.pp_rank < self.pp_size - 1:
+             dst_rank = dist.get_global_rank(self.pp_group, self.pp_rank + 1)
+             dist.send(hidden_state.contiguous(), dst=dst_rank, group=self.pp_group)
+
+        return target_activation
+
+    def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
+        if not dist.is_initialized(): return x
+        
+        # 聚合所有数据并行维度的值
+        if self.data_parallel_group:
+            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
+        if self.pipeline_parallel_group:
+            dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.pipeline_parallel_group)
+
+        if op == "mean":
+            dp_size = dist.get_world_size(self.data_parallel_group) if self.data_parallel_group else 1
+            x /= (dp_size * self.pp_size)
+        return x
     def fit(self):
-        # Use Tensor Cores even for fp32 matmuls
+        # 使用 Tensor Cores 加速 fp32 矩阵乘法
         torch.set_float32_matmul_precision("high")
 
         rank_zero = not dist.is_initialized() or dist.get_rank() == 0
-        is_data_parallel = dist.is_initialized() and self.train_cfg.dp_size > 1
-        device = self.model.device
+        device = torch.device("cuda", torch.cuda.current_device())
+        hook_name = self.train_cfg.hookpoint
 
+        # WandB 初始化
         if self.train_cfg.log_to_wandb and rank_zero:
             try:
                 import wandb
@@ -303,233 +408,235 @@ class SaeTrainer:
                     id=self.train_cfg.wandb_id,
                     config=asdict(self.train_cfg),
                     save_code=True,
-                    resume = "allow",
+                    resume="allow",
                 )
             except ImportError:
                 print("Weights & Biases not installed, skipping logging.")
                 self.train_cfg.log_to_wandb = False
 
-        num_tokens_in_step = 0
-
-        # For logging purposes
-        avg_auxk_loss = defaultdict(float)
-        average_reconstruction_loss = defaultdict(float)
-        avg_l1_loss = defaultdict(float)
-        average_multi_topk_loss = defaultdict(float)
-        avg_loss = defaultdict(float)
-
-        hidden_dict: dict[str, Tensor] = {}
-        module_for_sae = self.model.get_submodule(self.train_cfg.hookpoint)
-
-        def hook(module: nn.Module, _, outputs):
-            if isinstance(outputs, tuple):
-                outputs = outputs[0]
-            hidden_dict[self.train_cfg.hookpoint] = outputs.flatten(0, 1)
-
-        dist.barrier()
+        # 初始化 SAE 包装逻辑
         is_wrapped = False
         DP_wrapped_sae = None
+        if not is_wrapped:
+            if self.data_parallel_group and dist.get_world_size(self.data_parallel_group) > 1:
+                DP_wrapped_sae = DDP(self.sae, process_group=self.data_parallel_group)
+            else:
+                DP_wrapped_sae = self.sae
+            is_wrapped = True
+
+        dist.barrier()
         
-        for i, batch in enumerate(self.dl, start = self.i_start):
+        # #### [修改开始] 核心修复：强制同步 PP 组内的 SAE 初始权重 ####
+        # 原因：由于不同 PP Rank 加载模型层数不同，随机数生成器状态已偏移。
+        # 必须以 PP Rank 0 为“真理来源”，将其初始权重广播给同组的其他 Rank。
+        if self.pp_group and self.pp_size > 1:
+            # 1. 获取 PP 组内 Rank 0 的 全局 Rank (Global Rank)
+            # 注意：dist.broadcast 的 src 参数必须是全局 rank
+            src_global_rank = dist.get_global_rank(self.pp_group, 0)
+            
+            if rank_zero:
+                print(f"DEBUG: Broadcasting SAE initialization from Global Rank {src_global_rank} to ensure PP consistency.")
+
+            # 2. 遍历所有参数进行广播
+            # 包括 encoder.weight, encoder.bias, W_dec, b_dec 等
+            for name, param in self.sae.named_parameters():
+                # src=src_global_rank: 数据来源是 PP Rank 0
+                # group=self.pp_group: 只在当前 PP 管道内部广播
+                dist.broadcast(param.data, src=src_global_rank, group=self.pp_group)
+                
+            # 3. 如果使用了 Buffer (如 running_mean 等)，也要同步
+            for name, buffer in self.sae.named_buffers():
+                dist.broadcast(buffer.data, src=src_global_rank, group=self.pp_group)
+
+            dist.barrier() # 确保所有人同步完成再开始训练
+        grad_acc_steps = self.train_cfg.grad_acc_steps
+        micro_acc_steps = self.train_cfg.micro_acc_steps
+        total_steps_in_accumulation = grad_acc_steps * micro_acc_steps
+
+        # 初始化累加器
+        current_accumulation_metrics = defaultdict(float)
+
+        for i, batch in enumerate(self.dl, start=self.i_start):
             if i == 0 and self.train_cfg.save_at_init and self.i_start == 0:
                 self.save(0)
+            local_input_sum = batch["input_ids"].sum().item()
             
-            step, substep = divmod(i + 1, self.train_cfg.grad_acc_steps)
+            # 打印格式: [Rank Global_Rank] PP_Rank X | Step X | Input Sum: XXXXX
+            #print(f"[Rank {dist.get_rank()}] PP{self.pp_rank} | Step {i} | Input Sum: {local_input_sum}")
+            step, substep_idx = divmod(i + 1, grad_acc_steps)
             start_time = time.time()
             
-            hidden_dict.clear()
-            num_tokens_in_step += batch["input_ids"].numel()
+            # 1. Pipeline Forward & Broadcast
+            local_activation = self.pipeline_forward(batch)
+            bs, seq = batch["input_ids"].shape
+            hidden_dim = self.model.config.hidden_size
+            
+            if local_activation is None:
+                broadcast_buffer = torch.zeros((bs, seq, hidden_dim), device=device, dtype=self.model.dtype)
+            else:
+                broadcast_buffer = local_activation.contiguous()
+            
+            src_global_rank = dist.get_global_rank(self.pp_group, self.hook_owner_pp_rank)
+            dist.broadcast(broadcast_buffer, src=src_global_rank, group=self.pp_group)
+            # 在 fit() 中，dist.broadcast(broadcast_buffer, ...) 之后：
 
-            forward_hook_handle = module_for_sae.register_forward_hook(hook)
-            try:
-                with torch.no_grad():
-                    if self.train_cfg.varlen and "cu_seqlens" in batch:
-                        self.model(
-                            batch["input_ids"].to(device),
-                            cu_seqlens = batch["cu_seqlens"].to(device),
-                            max_seqlens = batch["max_seqlens"].to(device),
-                            max_layer_num = self.train_cfg.early_exit_inference_layer_num
-                        )                    
-                    else:
-                        self.model(batch["input_ids"].to(device), max_layer_num = self.train_cfg.early_exit_inference_layer_num)
-            finally:
-                forward_hook_handle.remove()
-
-
-            for name, hiddens in hidden_dict.items():
-                if i == 0 and self.i_start == 0:
-                    median = geometric_median(self.maybe_all_cat(hiddens))
-                    self.sae.b_dec.data = median.to(self.sae.config.get_torch_dtype())
-
-                if not is_wrapped:
-                    if self.train_cfg.fsdp and is_data_parallel:
-                        DP_wrapped_sae = FSDP(self.sae, process_group=self.data_parallel_group)
-                    elif is_data_parallel:
-                        DP_wrapped_sae = DDP(self.sae, process_group=self.data_parallel_group)
-                    else:
-                        DP_wrapped_sae = self.sae
-                    is_wrapped = True
-
-                if self.sae.config.normalize_decoder:
-                    self.sae.set_decoder_norm_to_unit_norm()
-
-                acc_steps = self.train_cfg.grad_acc_steps * self.train_cfg.micro_acc_steps
-                denom = acc_steps * self.train_cfg.wandb_log_frequency
-
-                for chunk in hiddens.chunk(self.train_cfg.micro_acc_steps):
-                    out = DP_wrapped_sae(
-                        chunk,
-                        dead_mask=(
-                            self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold
-                            if self.train_cfg.auxk_alpha > 0
-                            else None
-                        )
-                    )
-
-                    average_reconstruction_loss[name] += float(
-                        self.maybe_all_reduce(out.reconstruction_loss.detach()) / denom
-                    )
-                    average_multi_topk_loss[name] += float(
-                        self.maybe_all_reduce(out.multi_topk_loss.detach()) / denom
-                    )
-                    avg_l1_loss[name] += float(
-                        self.maybe_all_reduce(out.l1_loss.detach()) / denom
-                    )
-                    if self.train_cfg.auxk_alpha > 0:
-                        avg_auxk_loss[name] += float(
-                            self.maybe_all_reduce(out.auxk_loss.detach()) / denom
-                        )
-
-                    loss = out.loss
-                    loss = loss.div(acc_steps)
-                    
-                    loss_for_spike_analysis = loss.clone().detach()
-                    self.maybe_all_reduce(loss_for_spike_analysis)
-                    
-                    spike_threshold = 100
-                    if step > self.train_cfg.spike_detection_start and len(self.loss_history) > self.train_cfg.spike_detection_window_size:
-                         spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
-                         spike_threshold /= denom
-                    
-                    if loss_for_spike_analysis < spike_threshold:
-                        loss.backward()
-                    else:
-                        print(f"Omit Loss {loss}, threshold {spike_threshold}")
-
-                    avg_loss[name] += float((loss_for_spike_analysis / denom) * acc_steps)
-
-                    active_mask = out.sparse_feature_activations.flatten() > 0
-                    real_active_indices = out.sparse_feature_indices.flatten()[active_mask]
-
-                    self.did_fire[real_active_indices] = True
-
-                torch.nn.utils.clip_grad_norm_(self.sae.parameters(), 1.0)
+            if rank_zero: # 每10步打一次
+                act_mean = broadcast_buffer.mean().item()
+                act_std = broadcast_buffer.std().item()
+                act_max = broadcast_buffer.max().item()
                 
+                #print(f"🔍 [Step {step}] Activation Stats: Mean={act_mean:.4f}, Std={act_std:.4f}, Max={act_max:.4f}")
+                
+                if act_max == 0:
+                    print("❌ CRITICAL: Activations are ALL ZEROS! Check hookpoint index or pipeline communication.")
+                if math.isnan(act_mean):
+                    print("❌ CRITICAL: Activations contain NaNs!")
+            # #### [Fix 1] 几何中位数初始化 & 强制同步 Bias ####
+            # 这一步必须在拿到 broadcast_buffer (全量数据) 之后，切分数据之前做
+            if i == 0 and self.i_start == 0:
+                # 展平数据 [BS, Seq, Hidden] -> [N, Hidden]
+                all_activations = broadcast_buffer.flatten(0, 1)
+                
+                # 计算几何中位数
+                median = geometric_median(all_activations)
+                self.sae.b_dec.data = median.to(self.sae.config.get_torch_dtype())
+
+                # [关键] 强制在 PP 组内广播这个 Bias，确保所有 Rank 起点一致
+                if self.pp_group is not None and self.pp_size > 1:
+                    src_global_rank_0 = dist.get_global_rank(self.pp_group, 0)
+                    dist.broadcast(self.sae.b_dec.data, src=src_global_rank_0, group=self.pp_group)
+                    if self.pp_rank == 0 and rank_zero:
+                        print(f"DEBUG: Initialized and broadcasted geometric median bias.")
+            # #################################################
+            # 2. 切分 Batch (PP -> DP)
+            flat_hiddens = broadcast_buffer.flatten(0, 1)
+            total_tokens_batch = flat_hiddens.shape[0]
+            tokens_per_pp_rank = total_tokens_batch // self.pp_size
+            start_idx = self.pp_rank * tokens_per_pp_rank
+            end_idx = (self.pp_rank + 1) * tokens_per_pp_rank if self.pp_rank != self.pp_size - 1 else total_tokens_batch
+            my_hiddens = flat_hiddens[start_idx:end_idx]
+
+            if self.sae.config.normalize_decoder:
+                self.sae.set_decoder_norm_to_unit_norm()
+
+            # 3. Micro-batch 训练循环
+            chunks = my_hiddens.chunk(micro_acc_steps)
+            for chunk in chunks:
+                if chunk.numel() == 0: continue
+
+                out = DP_wrapped_sae(
+                    chunk,
+                    dead_mask=(
+                        self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold
+                        if self.train_cfg.auxk_alpha > 0
+                        else None
+                    )
+                )
+
+                # 梯度反传用的 Loss (除以总步数)
+                loss_for_backward = out.loss / total_steps_in_accumulation
+                loss_for_backward.backward()
+                
+                # 记录指标
+                with torch.no_grad():
+                    current_accumulation_metrics["loss"] += out.loss.detach()
+                    current_accumulation_metrics["fvu"] += out.reconstruction_loss.detach()
+                    
+                    # 记录 L1 (如果有)
+                    if hasattr(out, "l1_loss"):
+                        current_accumulation_metrics["l1"] += out.l1_loss.detach()
+                    
+                    # 【核心修复：记录 AuxK Loss】
+                    if hasattr(out, "auxk_loss"):
+                        current_accumulation_metrics["auxk"] += out.auxk_loss.detach()
+                    
+                    if hasattr(out, "multi_topk_loss"):
+                        current_accumulation_metrics["multi_topk"] += out.multi_topk_loss.detach()
+
+                # 更新本地死特征统计
+                active_mask = out.sparse_feature_activations.flatten() > 0
+                real_active_indices = out.sparse_feature_indices.flatten()[active_mask]
+                self.did_fire[real_active_indices] = True
+
+            # 4. PP 组梯度同步
+            for param in self.sae.parameters():
+                if param.grad is not None:
+                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.pp_group)
+
             time_elapsed = time.time() - start_time
             
-            if substep == 0:
+            # 5. 梯度累积周期结束 (进行更新和日志记录)
+            if substep_idx == 0:
                 self.dl_pbar.update(1)
-                if self.sae.config.normalize_decoder:
-                        self.sae.remove_gradient_parallel_to_decoder_directions()
+                
+                with torch.no_grad():
+                    # a. 本地平均 + 跨进程归约
+                    for key in list(current_accumulation_metrics.keys()):
+                        current_accumulation_metrics[key] /= total_steps_in_accumulation
+                        current_accumulation_metrics[key] = self.maybe_all_reduce(current_accumulation_metrics[key], op="mean")
 
-                self.optimizer.step()
+                final_step_loss = current_accumulation_metrics["loss"].item()
+                
+                # Spike Detection
+                spike_threshold = 1000.0
+                if len(self.loss_history) > self.train_cfg.spike_detection_window_size:
+                    spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
+                
+                if final_step_loss < spike_threshold:
+                    self.loss_history.append(final_step_loss)
+                    if self.sae.config.normalize_decoder:
+                        self.sae.remove_gradient_parallel_to_decoder_directions()
+                    self.optimizer.step()
+                else:
+                    if rank_zero: print(f"⚠️ Spike! Loss {final_step_loss:.2f} > {spike_threshold:.2f}")
+                
                 self.optimizer.zero_grad()
                 self.lr_scheduler.step()
                 
-                lr = self.optimizer.state_dict()["param_groups"][0]["lr"]
-
+                # 6. 死特征跨并行组同步 (MAX 归约)
                 with torch.no_grad():
-                    self.num_tokens_since_fired += num_tokens_in_step
-    # === [修复开始] 同步 did_fire ===
-                    # 如果使用了 DP，需要把所有 DP 组内的 did_fire 取并集 (Logical OR / MAX)
-                    if self.data_parallel_group is not None and dist.get_world_size(self.data_parallel_group) > 1:
-                        # bool 转 float/byte 才能 reduce，建议用 MAX (相当于 OR)
+                    if self.pp_size > 1 or (self.data_parallel_group and dist.get_world_size(self.data_parallel_group) > 1):
                         did_fire_float = self.did_fire.float()
-                        dist.all_reduce(did_fire_float, op=dist.ReduceOp.MAX, group=self.data_parallel_group)
+                        target_groups = [self.pp_group, self.data_parallel_group]
+                        for g in target_groups:
+                            if g is not None and dist.get_world_size(g) > 1:
+                                dist.all_reduce(did_fire_float, op=dist.ReduceOp.MAX, group=g)
                         self.did_fire = did_fire_float.bool()
-                    # === [修复结束] ===
+
+                    global_tokens = self.train_cfg.global_batch_size * self.train_cfg.ctx_len
+                    self.num_tokens_since_fired += global_tokens
                     self.num_tokens_since_fired[self.did_fire] = 0
-                    num_tokens_in_step = 0
                     self.did_fire.zero_()
 
-                mask = self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold
-                
-                # Spike Detection Check
-                if step > self.train_cfg.spike_detection_start and len(self.loss_history) > self.train_cfg.spike_detection_window_size:
-                    avg_loss_spike_threshold = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:]) * self.train_cfg.spike_detection_threshold_ratio
-                else:
-                    avg_loss_spike_threshold = 1000.0 # big enough
-                    
-                if avg_loss[self.train_cfg.hookpoint] < avg_loss_spike_threshold:
-                    self.loss_history.append(avg_loss[self.train_cfg.hookpoint])
-
-                info = {
-                    f"loss/fvu/{self.train_cfg.hookpoint}": average_reconstruction_loss[self.train_cfg.hookpoint],
-                    f"loss/loss/{self.train_cfg.hookpoint}": avg_loss[self.train_cfg.hookpoint],
-                    f"loss/l1_reg_loss/{self.train_cfg.hookpoint}": avg_l1_loss[self.train_cfg.hookpoint],
-                    f"dead_pct/{self.train_cfg.hookpoint}": mask.float().mean().item(),
-                    "train/lr": lr,
-                    "train/topk": 128,
-                    "train/step_time": time_elapsed,
-                    "train/tokens": i * self.train_cfg.local_batch_size * self.train_cfg.ctx_len * self.train_cfg.dp_size,
-                    "train/total_tokens": step * self.train_cfg.global_batch_size * self.train_cfg.ctx_len,
-                }
-                if self.train_cfg.auxk_alpha > 0:
-                    info[f"auxk/{self.train_cfg.hookpoint}"] = avg_auxk_loss[self.train_cfg.hookpoint]
-                info[f"multi_topk_fvu/{self.train_cfg.hookpoint}"] = average_multi_topk_loss[self.train_cfg.hookpoint]
-
-                avg_auxk_loss.clear()
-                average_reconstruction_loss.clear()
-                average_multi_topk_loss.clear()
-                avg_loss.clear()
-                avg_l1_loss.clear()
-
-                if self.train_cfg.distribute_modules:
-                    # Gather logs from MP ranks if needed
-                    # (Simplified: assuming Rank 0 is enough for WandB)
-                    pass
-
+                # 7. 日志上传
                 if self.train_cfg.log_to_wandb and rank_zero and step % self.train_cfg.wandb_log_frequency == 0:
+                    lr = self.optimizer.param_groups[0]["lr"]
+                    info = {
+                        f"loss/loss/{hook_name}": final_step_loss,
+                        f"loss/fvu/{hook_name}": current_accumulation_metrics["fvu"].item(),
+                        f"dead_pct/{hook_name}": (self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold).float().mean().item(),
+                        "train/lr": lr,
+                        "train/step_time": time_elapsed,
+                    }
+                    
+                    # 显式添加可选 Loss 项到日志
+                    if "auxk" in current_accumulation_metrics:
+                        info[f"auxk_loss/{hook_name}"] = current_accumulation_metrics["auxk"].item()
+                    if "l1" in current_accumulation_metrics:
+                        info[f"loss/l1_reg_loss/{hook_name}"] = current_accumulation_metrics["l1"].item()
+                    if "multi_topk" in current_accumulation_metrics:
+                        info[f"multi_topk_fvu/{hook_name}"] = current_accumulation_metrics["multi_topk"].item()
+                    
                     wandb.log(info, step=step)
+
+                # 重置累加器进入下一个梯度周期
+                current_accumulation_metrics.clear()
 
                 if step > 0 and step % self.train_cfg.save_every == 0:
                     self.save(step)
-        
-        if (i + 1) % 1000 == 0:
-            torch.cuda.empty_cache()
 
         self.save(step)
         self.dl_pbar.close()
-
-
-    def maybe_all_cat(self, x: Tensor) -> Tensor:
-        if not dist.is_initialized():
-            return x
-        if self.data_parallel_group is None:
-             return x
-        
-        buffer = x.new_empty([dist.get_world_size(self.data_parallel_group) * x.shape[0], *x.shape[1:]])
-        dist.all_gather_into_tensor(buffer, x, group = self.data_parallel_group)
-        return buffer
-
-
-    def maybe_all_reduce(self, x: Tensor, op: str = "mean") -> Tensor:
-        if not dist.is_initialized():
-            return x
-        if self.data_parallel_group is None:
-            return x
-
-        if op == "sum":
-            dist.all_reduce(x, op=dist.ReduceOp.SUM, group = self.data_parallel_group)
-        elif op == "mean":
-            dist.all_reduce(x, op=dist.ReduceOp.SUM, group = self.data_parallel_group)
-            x /= dist.get_world_size(self.data_parallel_group)
-        elif op == "max":
-            dist.all_reduce(x, op=dist.ReduceOp.MAX, group = self.data_parallel_group)
-        
-        return x
-
-
     def save(self, iter):
         """
         Save the SAEs to disk with Auto-Merge for Tensor Parallelism.
