@@ -71,11 +71,12 @@ class OpenSae(PreTrainedOpenSae):
             in_features=self.config.hidden_size, 
             out_features=self.config.feature_size, 
             bias=True)
+        print("全块权重",full_encoder.weight.sum().item())
 
         # 手动切分权重
         start_idx = self.mp_rank * self.local_feature_size
         end_idx = (self.mp_rank + 1) * self.local_feature_size
-
+        
         with torch.no_grad():
             local_weight = full_encoder.weight.data[start_idx:end_idx, :].clone()
             local_bias = full_encoder.bias.data[start_idx:end_idx].clone()
@@ -87,7 +88,9 @@ class OpenSae(PreTrainedOpenSae):
             device=device,
             dtype=self.config.get_torch_dtype()
         )
+        print("过一会的decoder,",self.encoder.weight.sum().item())
         self.encoder.weight.data.copy_(local_weight)
+        print("copy之后的,",self.encoder.weight.sum().item())
         self.encoder.bias.data.copy_(local_bias)
 
         del full_encoder
@@ -127,6 +130,7 @@ class OpenSae(PreTrainedOpenSae):
             self.decode_fn = torch_decode
             
         print(f"[Rank {self.mp_rank}] Encoder weight shape: {self.encoder.weight.shape}")
+        print("平均权重为",self.encoder.weight.sum().item())
 
     @torch.no_grad()
     def set_decoder_norm_to_unit_norm(self):
@@ -309,7 +313,8 @@ class OpenSae(PreTrainedOpenSae):
     def forward(
         self, 
         hidden: Tensor, 
-        dead_mask: Tensor | None = None
+        dead_mask: Tensor | None = None,
+        external_variance: Tensor | None = None
     ) -> SaeForwardOutput:
         # 1. SAE computation
         sae_encoder_output = self.encode(hidden, return_all_features = self.config.multi_topk)
@@ -324,8 +329,13 @@ class OpenSae(PreTrainedOpenSae):
         assert sae_decoder_output.shape == hidden.shape, f"Output shape mismatch"
         
         # 2. Variance
-        per_dimension_variance = (hidden - hidden.mean(0)).pow(2).sum(0)
-        per_dimension_variance = torch.clamp(per_dimension_variance, min=1.0)
+        if external_variance is not None:
+            # 如果传了全局方差，直接用它（这就是我们想要的！）
+            per_dimension_variance = external_variance
+        else:
+            # 否则回退到计算当前切片的局部方差
+            per_dimension_variance = (hidden - hidden.mean(0)).pow(2).sum(0)
+            per_dimension_variance = torch.clamp(per_dimension_variance, min=1.0)
         
         # 3. Compute losses
         
