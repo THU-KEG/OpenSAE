@@ -26,6 +26,9 @@ class OpenSaeConfig(PretrainedSaeConfig):
         multi_topk_multiplier: int | None = 4,
         auxk_alpha: float | None = 1e-2,
         l1_coef: float | None = None,
+        num_experts: int = 1,
+        k_experts: int = 1,
+        moe_loss_coef: float = 0.01,
         **kwargs
     ):
         super().__init__(
@@ -65,3 +68,11 @@ class OpenSaeConfig(PretrainedSaeConfig):
 
         self.auxk_alpha = auxk_alpha
         self.l1_coef = l1_coef
+        self.num_experts = num_experts
+        self.k_experts = k_experts
+        self.moe_loss_coef = moe_loss_coef
+        
+        # 校验
+        if self.num_experts > 1:
+            assert self.feature_size % self.num_experts == 0, \
+                f"Feature size {self.feature_size} must be divisible by num_experts {self.num_experts}"

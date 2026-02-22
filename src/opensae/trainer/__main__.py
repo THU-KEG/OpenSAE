@@ -92,7 +92,7 @@ def load_model_pipeline(args, rank: int, pp_rank: int, pp_size: int, mp_rank: in
     quantization_config = None
     if args.model.load_in_8bit:
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
-        
+
     if args.model.load_in_8bit:
         dtype = torch.float16
     elif torch.cuda.is_bf16_supported():
@@ -133,8 +133,12 @@ def load_model_pipeline(args, rank: int, pp_rank: int, pp_size: int, mp_rank: in
             if args.model.load_in_8bit
             else None
         ),
+        attn_implementation="flash_attention_2",
         device_map="cpu" ,
     )
+    # ... model = ... from_pretrained(...)
+    
+    # ... model.eval() ...
     model.eval()
     model.requires_grad_(False)
     model = llama_model_patch(model=model)

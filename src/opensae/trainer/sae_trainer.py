@@ -1,8 +1,3 @@
-"""
-SaeTrainer with Perfect PP Alignment
-关键洞察：切分时不应该对loss做any reduction，因为loss已经是基于局部数据的mean
-"""
-
 import os
 import math
 import time
@@ -22,6 +17,7 @@ from tqdm.auto import tqdm
 from transformers import PreTrainedModel, get_linear_schedule_with_warmup, get_wsd_schedule, get_cosine_schedule_with_warmup
 import numpy as np
 
+# 假设这些模块在你原本的路径下
 from ..saes import OpenSae, OpenSaeConfig
 from .train_arguments import TrainConfig, SaeConfig, ModelConfig
 from .train_utils import geometric_median
@@ -99,7 +95,10 @@ class SaeTrainer:
             normalize_decoder = sae_cfg.normalize_decoder,
             auxk_alpha = train_cfg.auxk_alpha,
             l1_coef = sae_cfg.l1_coef,
-            decoder_impl = sae_cfg.decoder_impl if hasattr(sae_cfg, 'decoder_impl') else "triton"
+            decoder_impl = sae_cfg.decoder_impl if hasattr(sae_cfg, 'decoder_impl') else "triton",
+            num_experts = getattr(sae_cfg, "num_experts", 1),
+            k_experts = getattr(sae_cfg, "k_experts", 1),
+            moe_loss_coef = getattr(sae_cfg, "moe_loss_coef", 0.01)
         )
         
         self.sae = OpenSae(open_sae_config, device, model_parallel_group=self.model_parallel_group)
@@ -239,90 +238,117 @@ class SaeTrainer:
 
     @torch.no_grad()
     def pipeline_forward(self, batch):
-        """Pipeline forward pass"""
-        input_ids = batch["input_ids"]
+        """
+        Pipeline forward pass (Robust Handshake Version)
+        """
         device = torch.device("cuda", torch.cuda.current_device())
         
-        if input_ids.dim() == 2:
-            batch_size, seq_len = input_ids.shape
-        else:
-            batch_size = 1 
-            seq_len = input_ids.shape[0]
+        # 1. 准备 Input IDs
+        input_ids = batch["input_ids"]
+        # 强制展平再升维，确保是 [1, Total_Seq] (Batch=1 模式)
+        input_ids = input_ids.view(-1).unsqueeze(0)
+        
+        # 默认形状
+        batch_size, seq_len = input_ids.shape
+        hidden_dim = self.model.config.hidden_size
 
+        attention_mask = None 
+        hidden_state = None
         cu_seqlens = batch.get("cu_seqlens", None)
         max_seqlens = batch.get("max_seqlens", None)
-        
         if cu_seqlens is not None:
             cu_seqlens = cu_seqlens.to(device)
         if max_seqlens is not None and isinstance(max_seqlens, torch.Tensor):
             max_seqlens = max_seqlens.to(device)
 
-        attention_mask = None 
-
-        hidden_state = None
+        # 2. Pipeline 通信逻辑 (Shape Handshake)
         if self.pp_rank == 0:
             input_ids = input_ids.to(device)
             hidden_state = self.model.embed_tokens(input_ids)
         else:
-            hidden_dim = self.model.config.hidden_size
-            recv_shape = (batch_size, seq_len, hidden_dim) if input_ids.dim() == 2 else (seq_len, hidden_dim)
-            hidden_state = torch.zeros(recv_shape, device=device, dtype=self.model.dtype)
             src_rank = dist.get_global_rank(self.pp_group, self.pp_rank - 1)
+            
+            # [Handshake Step 1] 接收形状
+            shape_tensor = torch.zeros(3, dtype=torch.long, device=device)
+            dist.recv(shape_tensor, src=src_rank, group=self.pp_group)
+            
+            # [Handshake Step 2] 解析形状
+            recv_shape = tuple(shape_tensor.tolist())
+            bs_recv, seq_recv, dim_recv = recv_shape
+            batch_size = bs_recv
+            seq_len = seq_recv 
+            
+            # [Handshake Step 3] 接收数据
+            hidden_state = torch.zeros(recv_shape, device=device, dtype=self.model.dtype)
             dist.recv(hidden_state, src=src_rank, group=self.pp_group)
+            hidden_state = hidden_state.view(batch_size, seq_len, hidden_dim)
 
+        # 3. Position IDs 处理
         if "position_ids" in batch:
             position_ids = batch["position_ids"].to(device)
+            if position_ids.numel() != batch_size * seq_len:
+                position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
+            elif position_ids.dim() != 2:
+                position_ids = position_ids.view(batch_size, seq_len)
         else:
             position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
-            if input_ids.dim() == 2:
+            if position_ids.shape[0] != batch_size:
                 position_ids = position_ids.repeat(batch_size, 1)
 
-        rotary_emb = self.model.rotary_emb
-        cos, sin = rotary_emb(hidden_state, position_ids)
-        position_embeddings = (cos, sin)
+        # 4. RoPE 计算
+        local_rotary_emb = self.model.rotary_emb
+        full_cos, full_sin = local_rotary_emb(hidden_state, position_ids)
 
         target_activation = None
+        
+        # 5. Layer 循环
         for i in range(self.my_start_layer, self.my_end_layer):
-            if i >= len(self.model.layers): 
-                break
+            if i >= len(self.model.layers): break
             layer = self.model.layers[i]
+            
+            # RoPE 维度适配
+            layer_head_dim = layer.self_attn.head_dim
+            if full_cos.shape[-1] > layer_head_dim:
+                current_cos = full_cos[..., :layer_head_dim]
+                current_sin = full_sin[..., :layer_head_dim]
+            else:
+                current_cos = full_cos
+                current_sin = full_sin
+            position_embeddings = (current_cos, current_sin)
             
             layer_out = layer(
                 hidden_state, 
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 position_embeddings=position_embeddings,
-                cu_seqlens=cu_seqlens,
-                max_seqlens=max_seqlens
+                cu_seqlens=cu_seqlens, 
+                max_seqlens=max_seqlens 
             )[0]
             
             hidden_state = layer_out
+
             if i == self.target_layer_idx:
-                target_activation = hidden_state.detach().clone()
+                target_activation = hidden_state.unsqueeze(0)
+            hidden_state=hidden_state.unsqueeze(0)
         
+        # 6. 发送给下一个 Rank
         if self.pp_rank < self.pp_size - 1:
             dst_rank = dist.get_global_rank(self.pp_group, self.pp_rank + 1)
+            curr_shape = torch.tensor(hidden_state.shape, dtype=torch.long, device=device)
+            dist.send(curr_shape, dst=dst_rank, group=self.pp_group)
             dist.send(hidden_state.contiguous(), dst=dst_rank, group=self.pp_group)
 
+        torch.cuda.synchronize()
         return target_activation
 
     def maybe_all_reduce(self, x: Tensor, op: str = "mean", skip_pp: bool = False) -> Tensor:
-        """
-        Helper for cross-replica reduction
-        
-        Args:
-            x: tensor to reduce
-            op: "mean" or "sum"
-            skip_pp: if True, don't reduce across PP (用于切分场景)
-        """
+        """Helper for cross-replica reduction"""
         if not dist.is_initialized(): 
             return x
         
-        # 聚合DP
         if self.data_parallel_group and dist.get_world_size(self.data_parallel_group) > 1:
             dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
             
-        # 聚合PP（可选）
         if not skip_pp and self.pipeline_parallel_group and dist.get_world_size(self.pipeline_parallel_group) > 1:
             dist.all_reduce(x, op=dist.ReduceOp.SUM, group=self.pipeline_parallel_group)
 
@@ -332,6 +358,7 @@ class SaeTrainer:
             x /= (dp_size * pp_size)
             
         return x
+
     def fit(self):
         """Main training loop"""
         torch.set_float32_matmul_precision("high")
@@ -365,8 +392,6 @@ class SaeTrainer:
         if dist.is_initialized():
             dist.barrier()
         
-
-
         grad_acc_steps = self.train_cfg.grad_acc_steps
         micro_acc_steps = self.train_cfg.micro_acc_steps
         total_acc_steps = grad_acc_steps * micro_acc_steps 
@@ -376,8 +401,15 @@ class SaeTrainer:
         avg_reconstruction_loss = defaultdict(float)
         avg_l1_loss = defaultdict(float)
         avg_auxk_loss = defaultdict(float)
+        avg_moe_loss = defaultdict(float)
 
         num_tokens_in_step = 0
+        
+        tokens_eligible_per_feature = torch.zeros(
+            self.sae.local_feature_size, 
+            device=device, 
+            dtype=torch.long
+        )
 
         # === Training Loop ===
         for i, batch in enumerate(self.dl, start=self.i_start):
@@ -391,7 +423,13 @@ class SaeTrainer:
             
             # === Pipeline Forward ===
             local_activation = self.pipeline_forward(batch)
-            bs, seq = batch["input_ids"].shape
+            
+            input_ids = batch["input_ids"]
+            if input_ids.dim() == 1:
+                bs, seq = 1, input_ids.shape[0]
+            else:
+                bs, seq = input_ids.shape
+            
             hidden_dim = self.model.config.hidden_size
             
             # === Broadcast ===
@@ -402,7 +440,7 @@ class SaeTrainer:
             
             src_global_rank = dist.get_global_rank(self.pp_group, self.hook_owner_pp_rank)
             dist.broadcast(broadcast_buffer, src=src_global_rank, group=self.pp_group)
-
+            
             # === 几何中位数初始化 ===
             if i == 0 and self.i_start == 0:
                 if dist.get_rank() == 0:
@@ -410,46 +448,64 @@ class SaeTrainer:
                         torch.manual_seed(self.train_cfg.seed)
                         median = geometric_median(broadcast_buffer.flatten(0, 1))
                         self.sae.b_dec.data = median.to(self.sae.config.get_torch_dtype())
-
                 
                 if dist.is_initialized():
                     dist.broadcast(self.sae.b_dec.data, src=0)
                     dist.barrier()
-                
-
-            # === 关键修复：数据切分策略 ===
-            flat_hiddens = broadcast_buffer.flatten(0, 1)
+            
+            # =======================================================
+            # [Fix 1] 完美的“整除”数据切分逻辑 (Perfect Alignment Strategy)
+            # =======================================================
+            # 1. 强制展平
+            flat_hiddens = broadcast_buffer.view(-1, hidden_dim)
             total_tokens = flat_hiddens.shape[0]
             
-            # 精确均分（丢弃余数）
+            # 2. 关键修改：使用整除 (//) 而非 ceil
+            # 这样保证每个 Rank 分到的 token 数完全一致 (tokens_per_rank)
             tokens_per_rank = total_tokens // self.pp_size
+            
             start_idx = self.pp_rank * tokens_per_rank
             end_idx = (self.pp_rank + 1) * tokens_per_rank
             
+            # 3. 切分
             my_hiddens = flat_hiddens[start_idx:end_idx]
+
+            # 立即释放大显存
+            del broadcast_buffer
+            del flat_hiddens
+
+            # =======================================================
+            # [Fix 2] 全程 float64 高精度统计 (保持不变)
+            # =======================================================
             if self.sae.config.normalize_decoder:
                 self.sae.set_decoder_norm_to_unit_norm()
+            
             hiddens_f32 = my_hiddens.detach().to(torch.float32)
+
+            # 1. Count
+            local_count = torch.tensor([hiddens_f32.shape[0]], device=device, dtype=torch.float64)
             
-            local_count = torch.tensor(hiddens_f32.shape[0], device=device, dtype=torch.float32)
-            local_sum = hiddens_f32.sum(dim=0)
-            local_sum_sq = hiddens_f32.pow(2).sum(dim=0)
-            
-            # 2. 全网同步 (PP组内)
+            # 2. Sum & SumSq
+            local_sum = hiddens_f32.sum(dim=0).contiguous()
+            local_sum_sq = hiddens_f32.pow(2).sum(dim=0).contiguous()
+
+
+            # 3. Sync
             if self.pp_size > 1:
                 dist.all_reduce(local_count, op=dist.ReduceOp.SUM, group=self.pp_group)
                 dist.all_reduce(local_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
                 dist.all_reduce(local_sum_sq, op=dist.ReduceOp.SUM, group=self.pp_group)
             
-            # 3. 计算“每个Token的平均方差” (Mean Variance per Token)
-            # Var = E[X^2] - (E[X])^2
+            # 4. Variance
             global_mean = local_sum / local_count
             global_mean_sq = local_sum_sq / local_count
             global_per_token_variance = global_mean_sq - global_mean.pow(2)
             
-            # 4. 安全钳位 (防止浮点误差导致负数)
+            global_per_token_variance = global_per_token_variance.to(torch.float32)
             global_per_token_variance = torch.clamp(global_per_token_variance, min=1e-6)
-            # Micro-batch 训练循环
+            
+            del hiddens_f32
+
             # === Micro-batch训练 ===
             chunks = my_hiddens.chunk(micro_acc_steps)
             
@@ -457,76 +513,72 @@ class SaeTrainer:
                 if chunk.numel() == 0: 
                     continue
                 current_chunk_variance = global_per_token_variance * chunk.shape[0]
-                
-                # 再次钳位，防止除以 0 (兜底)
                 current_chunk_variance = torch.clamp(current_chunk_variance, min=1.0)
+                chunk_f32 = chunk.to(torch.float32)
                 out = DP_wrapped_sae(
-                    chunk,
+                    chunk_f32,
                     dead_mask=(
                         self.num_tokens_since_fired > self.train_cfg.dead_feature_threshold
                         if self.train_cfg.auxk_alpha > 0
                         else None
                     ),
-                    external_variance=current_chunk_variance # <--- 传入！
+                    external_variance=current_chunk_variance
                 )
                 
-                # === 关键修复：Loss处理方式 ===
-                # 问题诊断：
-                # 1. out.loss 是基于 my_hiddens 的 MEAN loss
-                # 2. 不同PP rank的 my_hiddens 不同，所以 out.loss 也不同
-                # 3. 如果直接 all_reduce，相当于在求 mean of means，这是错误的！
-                
-                # 正确做法：
-                # 方案A: 将loss转换为SUM，然后all_reduce，最后除以total_tokens
-                # 方案B: 加权平均（每个rank的loss按其处理的token数加权）
-                
-                # 我们采用方案A（更简单）
-                
-                local_loss = out.loss.detach()  # 这是基于 chunk 的 mean loss
+                if out.expert_mask is not None:
+                    tokens_eligible_per_feature += out.expert_mask.long().sum(dim=0)
+                else:
+                    tokens_eligible_per_feature += chunk.shape[0]
+
+                # =======================================================
+                # [Fix 3] Loss 还原为 Sum 后聚合 (保持不变)
+                # =======================================================
+                local_loss = out.loss.detach()
                 local_recon = out.reconstruction_loss.detach()
-            
-                
-                # === 关键：转换为SUM形式 ===
-                # out.loss = sum(individual_losses) / num_samples_in_chunk
-                # 因此: sum(individual_losses) = out.loss * num_samples_in_chunk
                 num_samples_in_chunk = chunk.shape[0]
+                
                 loss_sum = local_loss * num_samples_in_chunk
                 recon_sum = local_recon * num_samples_in_chunk
                 
-                # === AllReduce SUM（跨PP rank）===
+                local_moe_loss = out.aux_moe_loss if hasattr(out, 'aux_moe_loss') and out.aux_moe_loss is not None else torch.tensor(0.0, device=device)
+                moe_loss_sum = local_moe_loss * num_samples_in_chunk
+
+                # AllReduce SUM
                 if self.pp_group and self.pp_size > 1:
-                    # 收集每个rank处理的样本数
                     num_samples_tensor = torch.tensor([num_samples_in_chunk], device=device, dtype=torch.float32)
                     total_samples_tensor = num_samples_tensor.clone()
                     dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM, group=self.pp_group)
                     total_samples = int(total_samples_tensor.item())
                     
-                    # AllReduce loss_sum
                     dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
                     dist.all_reduce(recon_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
+                    dist.all_reduce(moe_loss_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
                     
-                    # 转换回mean
                     global_loss_mean = loss_sum / total_samples
                     global_recon_mean = recon_sum / total_samples
+                    global_moe_loss_mean = moe_loss_sum / total_samples
                 else:
-                    # 没有PP，直接用local值
                     global_loss_mean = local_loss
                     global_recon_mean = local_recon
+                    global_moe_loss_mean = local_moe_loss
                 
-                # === 再处理DP维度 ===
+                # DP Reduce
                 if self.data_parallel_group and dist.get_world_size(self.data_parallel_group) > 1:
                     dist.all_reduce(global_loss_mean, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
                     dist.all_reduce(global_recon_mean, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
+                    dist.all_reduce(global_moe_loss_mean, op=dist.ReduceOp.SUM, group=self.data_parallel_group)
+                    
                     dp_size = dist.get_world_size(self.data_parallel_group)
                     global_loss_mean /= dp_size
                     global_recon_mean /= dp_size
+                    global_moe_loss_mean /= dp_size
               
-                # 累积到日志
                 avg_loss[hook_name] += float(global_loss_mean / log_denom)
                 avg_reconstruction_loss[hook_name] += float(global_recon_mean / log_denom)
+                avg_moe_loss[hook_name] += float(global_moe_loss_mean / log_denom)
 
-                # L1和AuxK同样处理
-                if hasattr(out, "l1_loss"):
+                # L1 处理
+                if hasattr(out, "l1_loss") and out.l1_loss is not None:
                     l1_sum = out.l1_loss.detach() * num_samples_in_chunk
                     if self.pp_group and self.pp_size > 1:
                         dist.all_reduce(l1_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
@@ -540,7 +592,8 @@ class SaeTrainer:
                     
                     avg_l1_loss[hook_name] += float(l1_mean / log_denom)
                 
-                if hasattr(out, "auxk_loss") and self.train_cfg.auxk_alpha > 0:
+                # AuxK 处理
+                if hasattr(out, "auxk_loss") and self.train_cfg.auxk_alpha > 0 and out.auxk_loss is not None:
                     auxk_sum = out.auxk_loss.detach() * num_samples_in_chunk
                     if self.pp_group and self.pp_size > 1:
                         dist.all_reduce(auxk_sum, op=dist.ReduceOp.SUM, group=self.pp_group)
@@ -554,11 +607,12 @@ class SaeTrainer:
                     
                     avg_auxk_loss[hook_name] += float(auxk_mean / log_denom)
 
-                # === Backward（使用原始的local loss）===
-                # 注意：backward时用的是local loss，因为梯度会在后面all_reduce
+                # === Backward ===
+                # 因为上面用了整除保证数据量一致，这里的 local loss 就可以直接用于 backward
+                # 后续的 all_reduce(AVG) 梯度将是数学上完美的
                 loss_for_backward = out.loss.div(total_acc_steps)
 
-                # Spike detection（使用global loss）
+                # Spike detection
                 spike_threshold = 1000.0
                 if len(self.loss_history) > self.train_cfg.spike_detection_window_size:
                     current_mean = np.mean(self.loss_history[-self.train_cfg.spike_detection_window_size:])
@@ -570,22 +624,23 @@ class SaeTrainer:
                     if rank_zero:
                         print(f"⚠️ Spike: {global_loss_mean.item():.2f} > {spike_threshold:.2f}")
 
-                # Dead features
+                # Dead features 标记
                 active_mask = out.sparse_feature_activations.flatten() > 0
                 real_active_indices = out.sparse_feature_indices.flatten()[active_mask]
                 self.did_fire[real_active_indices] = True
 
             # === 梯度同步 ===
-            # 因为每个PP rank用的是不同的数据切片，梯度必须all_reduce
             if self.pp_group and self.pp_size > 1:
                 for param in self.sae.parameters():
                     if param.grad is not None:
-                        # 关键：使用SUM而非AVG
-                        # 因为loss_for_backward已经除以了total_acc_steps
-                        # 而total_acc_steps在所有rank上是相同的
-                        # 所以我们需要的是梯度的平均值
+                        # 完美对齐：由于数据切分完全均等，梯度的 AVG 是正确的
                         dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.pp_group)
-            
+            # [新增] Router 梯度强行同步 (针对 TP 组)
+            # 这一步保证 TP 组内所有 Rank 的 Router 梯度完全比特级一致
+            if self.model_parallel_group and dist.get_world_size(self.model_parallel_group) > 1:
+                if hasattr(self.sae, "router") and self.sae.router.weight.grad is not None:
+                    # 使用 AVG 或 SUM 都可以，只要统一。这里用 AVG 消除浮点噪音。
+                    dist.all_reduce(self.sae.router.weight.grad, op=dist.ReduceOp.AVG, group=self.model_parallel_group)
             # === 验证梯度 ===
             if i == 0 and substep == 0:
                 grad_norm = 0.0
@@ -608,9 +663,10 @@ class SaeTrainer:
                 self.optimizer.zero_grad()
                 self.lr_scheduler.step()
                 
-                # Dead features
+                # Dead features 更新
                 with torch.no_grad():
-                    self.num_tokens_since_fired += num_tokens_in_step
+                    self.num_tokens_since_fired += tokens_eligible_per_feature
+                    
                     if dist.is_initialized():
                         did_fire_float = self.did_fire.float()
                         for g in [self.data_parallel_group, self.pp_group]:
@@ -619,10 +675,13 @@ class SaeTrainer:
                         self.did_fire = did_fire_float.bool()
                     
                     self.num_tokens_since_fired[self.did_fire] = 0
+                    
+                    # 清零状态
                     self.did_fire.zero_()
                     num_tokens_in_step = 0 
+                    tokens_eligible_per_feature.zero_() 
 
-                # Loss history（使用global loss）
+                # Loss history
                 if global_loss_mean.item() < spike_threshold:
                     self.loss_history.append(global_loss_mean.item())
 
@@ -637,6 +696,7 @@ class SaeTrainer:
                         f"loss/fvu/{hook_name}": avg_reconstruction_loss[hook_name],
                         f"loss/l1_reg_loss/{hook_name}": avg_l1_loss[hook_name],
                         f"dead_pct/{hook_name}": mask.float().mean().item(),
+                        f"moe_loss/{hook_name}": avg_moe_loss[hook_name], 
                         "train/lr": lr,
                         "train/step_time": time.time() - start_time,
                     }
@@ -644,19 +704,21 @@ class SaeTrainer:
                     if self.train_cfg.auxk_alpha > 0:
                         info[f"auxk_loss/{hook_name}"] = avg_auxk_loss[hook_name]
                     
-                    print(f"Step {step} | Loss: {avg_loss[hook_name]:.4f} | FVU: {avg_reconstruction_loss[hook_name]:.4f}")
+                    print(f"Step {step} | Loss: {avg_loss[hook_name]:.4f} | FVU: {avg_reconstruction_loss[hook_name]:.4f} | MoE: {avg_moe_loss[hook_name]:.4f}" )
                     wandb.log(info, step=step)
 
                     avg_loss.clear()
                     avg_reconstruction_loss.clear()
                     avg_l1_loss.clear()
                     avg_auxk_loss.clear()
+                    avg_moe_loss.clear()
 
                 if step > 0 and step % self.train_cfg.save_every == 0:
                     self.save(step)
 
         self.save(step)
         self.dl_pbar.close()
+
     def resume_training(self):
         """Resume Training with Tensor Parallelism Support."""
         mp_rank = dist.get_rank(self.model_parallel_group) if self.model_parallel_group else 0

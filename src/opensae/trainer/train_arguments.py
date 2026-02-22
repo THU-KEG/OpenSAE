@@ -24,6 +24,12 @@ class SaeConfig(Serializable):
     
     multi_topk: bool = False
     """Use Multi-TopK loss."""
+
+    num_experts: int = 1
+
+    k_experts: int = 1
+
+    moe_loss_coef: float = 0.01
     
     l1_coef: float | None = None
     """L1 regularization coefficient."""

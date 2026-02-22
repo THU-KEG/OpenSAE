@@ -1,17 +1,19 @@
 export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_P2P_DISABLE=1 # (可选) 禁用 P2P 也就是 NVLink，有时候能绕过硬件 bug
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1
 
-mp_size=2   # Must be 1 for now
+mp_size=1   # Must be 1 for now
 dp_size=1
-pp_size=1
+pp_size=2
+num_experts=128
+k_experts=8
 
-exp_name=test-opensae-trainer-tensor-on
+exp_name=test-opensae-trainer-moe-3
 
-hookpoint=layers.26
-exit_layer=26
-base_model="/data0/hjw/trainsae/Qwen3-1.7B"           # layer nums: 0 - 31
+hookpoint=layers.24
+exit_layer=24
+base_model="/data0/hjw/Qwen3-30B-Instruct"           # layer nums: 0 - 31
 dataset="/data0/zijun/DATA/training.mmap"
 
 
@@ -32,15 +34,20 @@ TRAIN_CONFIG="
 --mp_size ${mp_size} \
 --dp_size ${dp_size} \
 --pp_size ${pp_size} \
+--num_experts ${num_experts} \
+--k_experts ${k_experts} \
+--moe_loss_coef 5 \
 --fsdp False \
 --adam_in_8bit False \
---local_batch_size 8 \
+--num_experts 128 \
+--k_experts 8 \
+--local_batch_size 4 \
 --global_batch_size 256 \
 --micro_acc_steps 4 \
 --distribute_modules True \
---save_every 500 \
---save_dir /data0/hjw/CHECKPOINTS9 \
---load_dir /data0/hjw/CHECKPOINTS9 \
+--save_every 5000 \
+--save_dir /data0/hjw/CHECKPOINTS4 \
+--load_dir /data0/hjw/CHECKPOINTS4 \
 --dead_feature_threshold 10000000 \
 --multi_topk True \
 --k_scheduler constant \
@@ -55,7 +62,7 @@ TRAIN_CONFIG="
 --varlen True \
 --early_exit_inference_layer_num ${exit_layer} \
 --log_to_wandb True \
---wandb_project SAE_FOR_QWEN3_1234 \
+--wandb_project SAE_FOR_QWEN3_12349876 \
 --wandb_log_frequency 1 \
 "
 

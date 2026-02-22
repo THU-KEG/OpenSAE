@@ -43,6 +43,8 @@ class SaeForwardOutput(SaeEncoderOutput, SaeDecoderOutput):
     l1_loss: Tensor | None = None
     l2_loss: Tensor | None = None
     loss: Tensor = None
+    aux_moe_loss: Tensor | None=None
+    expert_mask: Tensor | None=None
     
 
 
