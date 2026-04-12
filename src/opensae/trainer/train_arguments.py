@@ -31,7 +31,7 @@ class SaeConfig(Serializable):
 
     moe_loss_coef: float = 0.01
     
-    l1_coef: float | None = None
+    l1_coef: float = 0
     """L1 regularization coefficient."""
     
     input_normalize: bool = True

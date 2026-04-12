@@ -620,6 +620,32 @@ class SaeTrainer:
                 
                 if global_loss_mean.item() < spike_threshold:
                     loss_for_backward.backward()
+                    
+                    # ================= NEW: Backward Graph Debug (绝对防漏版) =================
+                    if dist.is_initialized() and (not hasattr(self, "_printed_backward") or not self._printed_backward):
+                        self._printed_backward = True  # 只要进来一次就锁死，防止刷屏
+                        global_rank = dist.get_rank() if dist.is_initialized() else 0
+                        
+                        # 检查 Router 梯度
+                        router_grad = "N/A"
+                        if hasattr(self.sae, "router"):
+                            if self.sae.router.weight.grad is not None:
+                                router_grad = f"{self.sae.router.weight.grad.norm().item():.6f}"
+                            else:
+                                router_grad = "NONE (🚨 计算图断裂！)"
+                                
+                        # 检查 Encoder 梯度
+                        enc_grad = "N/A"
+                        if self.sae.encoder.weight.grad is not None:
+                            enc_grad = f"{self.sae.encoder.weight.grad.norm().item():.6f}"
+
+                        print(
+                            f"🧨 [Backward | Rank {global_rank}]\n"
+                            f"    ├─ Encoder Grad Norm: {enc_grad}\n"
+                            f"    └─ Router Grad Norm : {router_grad}  <-- 请盯紧这个值！\n"
+                            f"---------------------------------------------------"
+                        )
+                    # ==============================================================
                 else:
                     if rank_zero:
                         print(f"⚠️ Spike: {global_loss_mean.item():.2f} > {spike_threshold:.2f}")
@@ -755,6 +781,11 @@ class SaeTrainer:
                 new_state_dict["W_dec"] = state_dict["W_dec"][start_idx:end_idx, :]
             if "b_dec" in state_dict:
                 new_state_dict["b_dec"] = state_dict["b_dec"]
+            # ================= NEW: 加载 MoE Router 权重 =================
+            if getattr(self.sae, "use_moe", False) and "router.weight" in state_dict:
+                # 不切片，直接全量赋给本地的 router
+                new_state_dict["router.weight"] = state_dict["router.weight"]
+            # ==========================================================
 
             self.sae.load_state_dict(new_state_dict, strict=False)
             print(f"[Rank {dist.get_rank()}] Model weights sliced and loaded.")
@@ -800,15 +831,18 @@ class SaeTrainer:
     def save(self, iter):
         """Save the SAEs to disk with Auto-Merge for Tensor Parallelism."""
         
-        mp_rank = dist.get_rank(self.model_parallel_group) if self.model_parallel_group else 0
-        mp_world_size = dist.get_world_size(self.model_parallel_group) if self.model_parallel_group else 1
-        dp_rank = dist.get_rank(self.data_parallel_group) if self.data_parallel_group else 0
+        mp_rank = getattr(self.sae, "mp_rank", 0)
+        mp_world_size = getattr(self.sae, "mp_world_size", 1)
+        
+        # 获取全集群唯一的物理卡号 (0 ~ 7)
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
         
         def gather_and_merge(local_tensor, dim=0):
             if mp_world_size == 1:
                 return local_tensor.cpu()
             
             gathered_list = [torch.zeros_like(local_tensor) for _ in range(mp_world_size)] if mp_rank == 0 else None
+            # 注意：只要是属于 model_parallel_group 的都需要执行 gather
             dist.gather(local_tensor, gathered_list, dst=0, group=self.model_parallel_group)
             
             if mp_rank == 0:
@@ -816,39 +850,48 @@ class SaeTrainer:
                 return full_tensor
             return None
 
-        if dp_rank == 0:
-            if mp_rank == 0:
-                print(f"[Iter {iter}] Gathering SAE weights from all MP ranks to Rank 0...")
-
-            full_encoder_weight = gather_and_merge(self.sae.encoder.weight.data, dim=0)
-            full_encoder_bias = gather_and_merge(self.sae.encoder.bias.data, dim=0)
+        # 1. 所有人（按MP组）一起执行 gather，但只有 mp_rank=0 会拿到合并后的 Tensor
+        full_encoder_weight = gather_and_merge(self.sae.encoder.weight.data, dim=0)
+        full_encoder_bias = gather_and_merge(self.sae.encoder.bias.data, dim=0)
+        
+        if self.sae.decoder:
+            full_decoder_weight = gather_and_merge(self.sae.W_dec.data, dim=0)
+        else:
+            full_decoder_weight = None
             
-            if self.sae.decoder:
-                full_decoder_weight = gather_and_merge(self.sae.W_dec.data, dim=0)
-            else:
-                full_decoder_weight = None
-            
-            full_decoder_bias = self.sae.b_dec.data.cpu() if mp_rank == 0 else None
+        full_decoder_bias = self.sae.b_dec.data.cpu() if mp_rank == 0 else None
 
-            if mp_rank == 0:
-                save_path = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'saes', self.train_cfg.hookpoint)
-                Path(save_path).mkdir(parents=True, exist_ok=True)
+        # ===============================================================
+        # 2. 【终极防并发锁】全集群 8 张卡，只允许 Global Rank 0 写合并后的主模型！
+        # ===============================================================
+        if global_rank == 0:
+            print(f"[Iter {iter}] Gathering SAE weights to Global Rank 0 and saving...")
+            save_path = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'saes', self.train_cfg.hookpoint)
+            Path(save_path).mkdir(parents=True, exist_ok=True)
 
-                full_state_dict = {
-                    "encoder.weight": full_encoder_weight,
-                    "encoder.bias": full_encoder_bias,
-                    "b_dec": full_decoder_bias,
-                }
-                if full_decoder_weight is not None:
-                    full_state_dict["W_dec"] = full_decoder_weight
-
-                torch.save(full_state_dict, os.path.join(save_path, f"iter_{iter:07d}.pt"))
-                with open(os.path.join(save_path, "latest_checkpoint.txt"), "w") as f:
-                    f.write(str(iter))
+            full_state_dict = {
+                "encoder.weight": full_encoder_weight,
+                "encoder.bias": full_encoder_bias,
+                "b_dec": full_decoder_bias,
+            }
+            if full_decoder_weight is not None:
+                full_state_dict["W_dec"] = full_decoder_weight
                 
-                print(f"Saved merged checkpoint to {save_path}")
+            # 保存 MoE Router 权重
+            if getattr(self.sae, "use_moe", False) and hasattr(self.sae, "router"):
+                full_state_dict["router.weight"] = self.sae.router.weight.data.cpu()
 
-            print(f"Model Parallel {mp_rank} Saving Optimization States (Sharded)")
+            torch.save(full_state_dict, os.path.join(save_path, f"iter_{iter:07d}.pt"))
+            with open(os.path.join(save_path, "latest_checkpoint.txt"), "w") as f:
+                f.write(str(iter))
+            print(f"Saved merged checkpoint to {save_path}")
+
+        # ===============================================================
+        # 3. 【终极防并发锁】写优化器时，只允许 Global Rank 等于自己的 MP Rank 才能写！
+        # (比如 MP=2 时，只有 0号物理卡写 mp0.pt，1号物理卡写 mp1.pt，其余 6 张卡直接罚站！)
+        # ===============================================================
+        if global_rank == mp_rank:
+            print(f"Model Parallel {mp_rank} Saving Optimization States (Sharded) from Global Rank {global_rank}")
             optimizer_save_dir = self.train_cfg.hookpoint
             save_path_opt = os.path.join(self.train_cfg.save_dir, self.train_cfg.run_name, 'optimizer', optimizer_save_dir)
             Path(save_path_opt).mkdir(parents=True, exist_ok=True)
@@ -870,5 +913,6 @@ class SaeTrainer:
                 with open(os.path.join(save_path_opt, "latest_checkpoint.txt"), "w") as f:
                     f.write(str(iter))
 
+        # 所有人等写盘的兄弟写完
         if dist.is_initialized():
             dist.barrier()

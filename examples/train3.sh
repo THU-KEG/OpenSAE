@@ -1,19 +1,19 @@
 export WANDB_API_KEY="dd71f286a1b06ec9081aa8ac585c09735f785fcd"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export NCCL_P2P_DISABLE=1 # (可选) 禁用 P2P 也就是 NVLink，有时候能绕过硬件 bug
-export CUDA_VISIBLE_DEVICES=4,5,6,7
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 
 mp_size=1   # Must be 1 for now
 dp_size=4
 pp_size=1
-num_experts=1
+num_experts=2
 k_experts=1
 
-exp_name=test-opensae-trainer-exp1
+exp_name=test-opensae-trainer-exp2-2
 
-hookpoint=layers.26
-exit_layer=26
-base_model="/home/hujw/Qwen2.5-Math-1.5B"             # layer nums: 0 - 31
+hookpoint=layers.24
+exit_layer=24
+base_model="/home/hujw/Qwen3-1.7B"           # layer nums: 0 - 31
 dataset="/data/hujw/training.mmap"
 
 
@@ -45,9 +45,9 @@ TRAIN_CONFIG="
 --global_batch_size 256 \
 --micro_acc_steps 4 \
 --distribute_modules True \
---save_every 100 \
---save_dir /data/hujw/CHECKPOINTSN \
---load_dir /data/hujw/CHECKPOINTSN \
+--save_every 1000 \
+--save_dir /data/hujw/CHECKPOINTSMOE3 \
+--load_dir /data/hujw/CHECKPOINTSMOE3 \
 --dead_feature_threshold 10000000 \
 --multi_topk True \
 --k_scheduler constant \
@@ -62,7 +62,7 @@ TRAIN_CONFIG="
 --varlen True \
 --early_exit_inference_layer_num ${exit_layer} \
 --log_to_wandb True \
---wandb_project SAE_FOR_QWEN3_FORRL \
+--wandb_project SAE_FOR_QWEN3MOE_1.7B \
 --wandb_log_frequency 1 \
 "
 

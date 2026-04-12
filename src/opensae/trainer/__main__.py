@@ -141,7 +141,7 @@ def load_model_pipeline(args, rank: int, pp_rank: int, pp_size: int, mp_rank: in
     # ... model.eval() ...
     model.eval()
     model.requires_grad_(False)
-    model = llama_model_patch(model=model)
+    #model = llama_model_patch(model=model)
     device = torch.device(f"cuda:{rank}")
     
     def safe_to(module, device):
